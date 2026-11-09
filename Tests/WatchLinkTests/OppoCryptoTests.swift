@@ -187,29 +187,152 @@ final class OppoCryptoTests: XCTestCase {
         XCTAssertTrue(pair.modulus.first.map { $0 & 0x80 != 0 } == true)
         // Rebuild a separate public key from exactly the parameters sent on the
         // wire, not from the object's private key or a shared DER parser.
-        let publicDER = rsaPublicDER(modulus: pair.modulus, exponent: pair.exponent)
-        let publicKey = try XCTUnwrap(SecKeyCreateWithData(publicDER as CFData, [
-            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
-            kSecAttrKeySizeInBits as String: 2048
-        ] as CFDictionary, nil))
         let syntheticSessionKey = Data((0..<32).map(UInt8.init))
-        let encrypted = try XCTUnwrap(SecKeyCreateEncryptedData(publicKey, .rsaEncryptionPKCS1,
-                                                               syntheticSessionKey as CFData, nil))
-        XCTAssertEqual(try pair.decryptPKCS1(encrypted as Data), syntheticSessionKey)
+        let encrypted = try encryptWithPublicParameters(pair, plaintext: syntheticSessionKey)
+        XCTAssertEqual(try pair.decryptPKCS1(encrypted), syntheticSessionKey)
     }
 
-    func testRSARejectsWrongLengthAndInvalidPKCS1Block() throws {
+    func testRSARejectsPubliclyInvalidCiphertextLengths() throws {
         let pair = try OppoRSAKeyPair()
         for length in [0, 255, 257] {
             assertCryptoError(.invalidRSACiphertextLength) {
                 _ = try pair.decryptPKCS1(Data(repeating: 0, count: length))
             }
         }
-        assertCryptoError(.rsaDecryptionFailed) {
-            _ = try pair.decryptPKCS1(Data(repeating: 0, count: 256))
+    }
+
+    func testRSARejectsValidPKCS1MessagesWithNonSessionKeyLengths() throws {
+        let pair = try OppoRSAKeyPair()
+        for length in [31, 33] {
+            // Valid RSA padding, invalid protocol key size. This result is
+            // deterministic and does not depend on padding-error disclosure.
+            let ciphertext = try encryptWithPublicParameters(pair, plaintext: Data(repeating: 0x42, count: length))
+            assertCryptoError(.invalidSessionKeyLength) {
+                _ = try pair.decryptPKCS1(ciphertext)
+            }
         }
     }
+
+    func testInvalidRSABlockCannotAuthenticateWithLivePrimitives() throws {
+        let pair = try OppoRSAKeyPair()
+        let engine = try liveEngineReadyForSession(pair)
+        // Security can either reject this PKCS#1 block or return candidate
+        // bytes. Do not assert which behavior the operating system chooses.
+        // If a 32-byte candidate is returned, the independent AES proof must
+        // still fail: prefix0 specifies sixteen plaintext bytes, not four.
+        let actions = try deliverSessionProof(to: engine,
+                                             encryptedKey: Data(repeating: 0, count: 256),
+                                             plaintext: hex("01020304"),
+                                             envelope: Data([0]) + Data(repeating: 0, count: 16))
+        assertSessionRejected(engine, actions: actions)
+    }
+
+    func testValidRSAKeyCannotAuthenticateWithTamperedAESProof() throws {
+        let pair = try OppoRSAKeyPair()
+        let engine = try liveEngineReadyForSession(pair)
+        let ciphertext = try encryptWithPublicParameters(pair, plaintext: Data((0..<32).map(UInt8.init)))
+        // Independent AES-256 CTR fixture above, with the last padding byte
+        // flipped. This forces the real RSA -> real AES -> state-machine path.
+        let actions = try deliverSessionProof(to: engine, encryptedKey: ciphertext,
+                                             plaintext: hex("0102030405"),
+                                             envelope: hex("0b5b6c07530dfb7196f02e553d02c3a693"))
+        assertSessionRejected(engine, actions: actions)
+    }
+
+    private func encryptWithPublicParameters(_ pair: OppoRSAKeyPair, plaintext: Data) throws -> Data {
+        let publicDER = rsaPublicDER(modulus: pair.modulus, exponent: pair.exponent)
+        let publicKey = try XCTUnwrap(SecKeyCreateWithData(publicDER as CFData, [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
+            kSecAttrKeySizeInBits as String: 2048
+        ] as CFDictionary, nil))
+        let encrypted = try XCTUnwrap(SecKeyCreateEncryptedData(publicKey, .rsaEncryptionPKCS1,
+                                                               plaintext as CFData, nil))
+        return encrypted as Data
+    }
+
+    /// Drive the genuine identity primitives with synthetic inputs, then leave
+    /// the engine awaiting cid37 after successful physical submission/ATT ack.
+    private func liveEngineReadyForSession(_ pair: OppoRSAKeyPair) throws -> OppoAuthentication {
+        let clientNonce: UInt64 = 1_700_000_000_000
+        let watchNonce: UInt64 = 1_700_000_000_123
+        let challenge = hex("01234567")
+        var dependencies = OppoAuthentication.Dependencies.live
+        dependencies.makeNonce = { clientNonce }
+        dependencies.randomChallenge = { challenge }
+        dependencies.makeRSA = {
+            OppoAuthentication.RSAContext(modulus: pair.modulus, exponent: pair.exponent,
+                                          decrypt: { try pair.decryptPKCS1($0) })
+        }
+        let engine = OppoAuthentication(dependencies: dependencies)
+        let capabilities = OppoTransportCapabilities(
+            protocolVersion: 5, maxFrameSize: 20, maxTransmissionUnit: 20,
+            interval: 10, supportProtocol: 3, commandID: 0x81, controlFlags: 0,
+            frameCount: 1, frameShape: "SINGLE_FRAME", crcValidation: "CRC16_LE_VERIFIED",
+            encodedFieldNumbers: [1, 2, 3, 4, 5])
+        let nonce = try sentCommand(engine.start(capabilities: capabilities))
+        _ = engine.didSubmit(token: nonce.token, streamOffset: 100)
+        XCTAssertTrue(engine.writeCompleted(token: nonce.token, succeeded: true).isEmpty)
+        let nonceReply = try OppoProtobufWriter.encode([1: .varint(watchNonce)])
+        let identity = try sentCommand(engine.receive(wireMessage(command: 24, body: nonceReply, offset: 100)))
+        _ = engine.didSubmit(token: identity.token, streamOffset: 200)
+        XCTAssertTrue(engine.writeCompleted(token: identity.token, succeeded: true).isEmpty)
+        // Independently reconstructed synthetic complement-reply fixture.
+        let identityReply = try OppoProtobufWriter.encode([
+            2: .bytes(hex("0c6b56b960b58cc87b89f4f87178c374e2"))
+        ])
+        let rsa = try sentCommand(engine.receive(wireMessage(command: 25, body: identityReply, offset: 200)))
+        XCTAssertEqual(rsa.commandID, 36)
+        _ = engine.didSubmit(token: rsa.token, streamOffset: 300)
+        XCTAssertTrue(engine.writeCompleted(token: rsa.token, succeeded: true).isEmpty)
+        XCTAssertEqual(engine.phase, .sessionKeys)
+        XCTAssertTrue(engine.identityVerified)
+        return engine
+    }
+
+    private func deliverSessionProof(to engine: OppoAuthentication, encryptedKey: Data,
+                                     plaintext: Data, envelope: Data) throws -> [OppoAuthentication.Action] {
+        let body = try OppoProtobufWriter.encode([
+            1: .bytes(encryptedKey), 2: .bytes(hex("000102030405060708090a0b0c0d0e0f")),
+            3: .bytes(plaintext), 4: .bytes(envelope)
+        ])
+        return engine.receive(wireMessage(command: 37, body: body, offset: 300))
+    }
+
+    private func assertSessionRejected(_ engine: OppoAuthentication, actions: [OppoAuthentication.Action],
+                                       file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(engine.phase, .failed, file: file, line: line)
+        XCTAssertFalse(engine.keyExchangeVerified, file: file, line: line)
+        XCTAssertFalse(actions.contains { if case .completed = $0 { return true }; return false }, file: file, line: line)
+        XCTAssertFalse(actions.contains {
+            if case .send(let command) = $0 { return command.commandID & 0x7f == 37 }
+            return false
+        }, file: file, line: line)
+        XCTAssertEqual(actions.count, 1, file: file, line: line)
+        guard let action = actions.first, case .failed(let failure) = action else {
+            XCTFail("Invalid session proof must produce a failure", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(failure.phase, .sessionKeys, file: file, line: line)
+    }
+
+    private func wireMessage(command: UInt8, body: Data, offset: Int) -> OppoWireMessage {
+        OppoWireMessage(serviceID: 1, commandID: command, protobuf: body, streamOffset: offset,
+                        controlFlags: 0, frameCount: 1, frameShape: "SINGLE_FRAME",
+                        crcValidation: "CRC16_LE_VERIFIED")
+    }
+
+    private func sentCommand(_ actions: [OppoAuthentication.Action]) throws -> OppoAuthentication.Command {
+        XCTAssertEqual(actions.count, 1)
+        let action = try XCTUnwrap(actions.first)
+        guard case .send(let command) = action else {
+            XCTFail("Expected an authentication request")
+            throw FixtureError.unexpectedAction
+        }
+        return command
+    }
+
+    private enum FixtureError: Error { case unexpectedAction }
 
     private func assertCryptoError(_ expected: OppoCryptoError, file: StaticString = #filePath, line: UInt = #line,
                                    _ body: () throws -> Void) {

@@ -128,6 +128,10 @@ final class OppoRSAKeyPair {
         exponent = parameters.exponent
     }
 
+    /// Returns only a candidate 32-byte AES-256 session key. Security may return
+    /// candidate bytes for an invalid PKCS#1 block instead of a padding error.
+    /// A returned value is therefore not proof: the caller must still verify
+    /// the complete, independently supplied AESConsult plaintext/envelope pair.
     func decryptPKCS1(_ ciphertext: Data) throws -> Data {
         guard ciphertext.count == 256 else { throw OppoCryptoError.invalidRSACiphertextLength }
         guard SecKeyIsAlgorithmSupported(privateKey, .decrypt, .rsaEncryptionPKCS1) else {
@@ -138,7 +142,7 @@ final class OppoRSAKeyPair {
             throw OppoCryptoError.rsaDecryptionFailed
         }
         let plaintext = result as Data
-        guard !plaintext.isEmpty else { throw OppoCryptoError.rsaDecryptionFailed }
+        guard plaintext.count == 32 else { throw OppoCryptoError.invalidSessionKeyLength }
         return plaintext
     }
 }
