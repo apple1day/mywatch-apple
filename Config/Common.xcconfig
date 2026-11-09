@@ -1,0 +1,3 @@
+// Optional user-owned signing settings; never committed.
+CODE_SIGN_STYLE = Automatic
+#include? "Signing.local.xcconfig"

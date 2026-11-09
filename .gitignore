@@ -1,0 +1,12 @@
+/WatchLink.xcodeproj/
+/build/
+/dist/
+/Config/*.local.xcconfig
+/Config/*.local.xcconfig.tmp
+*.xcuserstate
+xcuserdata/
+.DS_Store
+__pycache__/
+*.pyc
+*.p12
+*.mobileprovision

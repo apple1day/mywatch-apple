@@ -1,0 +1,3 @@
+#include "Common.xcconfig"
+PRODUCT_BUNDLE_IDENTIFIER = com.anxiong.watchlink.ios
+#include? "WatchLink.Release.local.xcconfig"
