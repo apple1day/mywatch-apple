@@ -40,14 +40,17 @@ final class HomeUITests: XCTestCase {
             predicate: NSPredicate(format: "value == %@", "已展开"), object: disclosure)
         XCTAssertEqual(XCTWaiter.wait(for: [expanded], timeout: 5), .completed)
 
-        let preview = app.descendants(matching: .any)
-            .matching(identifier: "reportJSONPreview").firstMatch
+        // Match the Text's actual identifier, rather than asking every element
+        // type for all identifier/label/value aliases in the accessibility tree.
+        let preview = app.staticTexts
+            .matching(NSPredicate(format: "identifier == %@", "reportJSONPreview")).firstMatch
         XCTAssertTrue(preview.waitForExistence(timeout: 5))
-        XCTAssertTrue(preview.label.contains("schemaVersion"))
-        XCTAssertTrue(preview.label.contains("UNAVAILABLE_VIA_PUBLIC_IOS_API"))
-        XCTAssertTrue(preview.label.contains("NOT_IMPLEMENTED"))
-        XCTAssertTrue(preview.label.contains("TRANSPORT_CAPABILITY_QUERY_ONLY"))
-        XCTAssertTrue(preview.label.contains("NOT_OBSERVABLE_VIA_PUBLIC_CORE_BLUETOOTH_API"))
+        let reportText = preview.label
+        XCTAssertTrue(reportText.contains("schemaVersion"))
+        XCTAssertTrue(reportText.contains("UNAVAILABLE_VIA_PUBLIC_IOS_API"))
+        XCTAssertTrue(reportText.contains("NOT_IMPLEMENTED"))
+        XCTAssertTrue(reportText.contains("TRANSPORT_CAPABILITY_QUERY_ONLY"))
+        XCTAssertTrue(reportText.contains("NOT_OBSERVABLE_VIA_PUBLIC_CORE_BLUETOOTH_API"))
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "WatchLink-first-report-snapshot"
