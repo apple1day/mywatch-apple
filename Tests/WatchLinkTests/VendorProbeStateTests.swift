@@ -65,7 +65,7 @@ final class VendorProbeStateTests: XCTestCase {
         let data = try JSONEncoder().encode(snapshot)
         let restored = try JSONDecoder().decode(VendorProbeSnapshot.self, from: data)
         XCTAssertEqual(restored, snapshot)
-        XCTAssertEqual(restored.vendorAuthentication, "NOT_IMPLEMENTED")
+        XCTAssertEqual(restored.vendorAuthentication, "NOT_ATTEMPTED")
     }
 
     func testNoATTResultCanBeAssignedBeforeAQueryWasSubmitted() {
@@ -75,5 +75,95 @@ final class VendorProbeStateTests: XCTestCase {
         XCTAssertFalse(snapshot.attWriteAcknowledged)
         XCTAssertNil(snapshot.attWriteCompletedAt)
         XCTAssertEqual(snapshot.status, "NOT_ATTEMPTED")
+    }
+}
+
+final class VendorCommandAndCapabilityTests: XCTestCase {
+    func testPartialOrDuplicateATTReceiptCannotCompleteLogicalCommand() {
+        var write = VendorCommandWriteSnapshot(commandID: 25, stage: "IDENTITY_CHECK", frameCount: 3,
+                                                queuedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertFalse(write.recordCallback(error: nil, at: Date()))
+        XCTAssertTrue(write.recordSubmission(index: 0, at: Date()))
+        XCTAssertFalse(write.recordSubmission(index: 1, at: Date()))
+        XCTAssertTrue(write.recordCallback(error: nil, at: Date()))
+        XCTAssertFalse(write.recordCallback(error: nil, at: Date()))
+        XCTAssertFalse(write.fullyAcknowledged)
+        for index in 1..<3 {
+            XCTAssertTrue(write.recordSubmission(index: index, at: Date()))
+            XCTAssertTrue(write.recordCallback(error: nil, at: Date()))
+        }
+        XCTAssertTrue(write.fullyAcknowledged)
+        XCTAssertFalse(write.recordSubmission(index: 3, at: Date()))
+    }
+
+    func testATTFailurePreventsFurtherSubmissionAndLateSuccess() throws {
+        var write = VendorCommandWriteSnapshot(commandID: 36, stage: "SESSION_KEY_EXCHANGE", frameCount: 3,
+                                                queuedAt: Date(timeIntervalSince1970: 0))
+        let failure = VendorGATTTransport.Failure(phase: "COMMAND_WRITE", domain: "CBATTErrorDomain",
+                                                 code: 5, message: "write failed")
+        XCTAssertTrue(write.recordSubmission(index: 0, at: Date()))
+        XCTAssertTrue(write.recordCallback(error: failure, at: Date()))
+        XCTAssertFalse(write.recordCallback(error: nil, at: Date()))
+        XCTAssertFalse(write.recordSubmission(index: 1, at: Date()))
+        XCTAssertFalse(write.fullyAcknowledged)
+        XCTAssertEqual(write.acknowledgedFragments, 0)
+        XCTAssertEqual(write.callbackCount, 1)
+        XCTAssertEqual(try JSONDecoder().decode(VendorCommandWriteSnapshot.self,
+                                                from: JSONEncoder().encode(write)), write)
+    }
+
+    func testActiveCapabilitiesRetainObservationSourceAndNeverInventAResponse() throws {
+        let early = capability()
+        let choice = try XCTUnwrap(VendorCapabilitySelection.choose(response: nil, unsolicited: early))
+        XCTAssertEqual(choice.source, "PRE_QUERY_OBSERVATION")
+        XCTAssertEqual(choice.capabilities, early)
+        XCTAssertNil(try VendorCapabilitySelection.choose(response: nil, unsolicited: nil))
+        let later = try XCTUnwrap(VendorCapabilitySelection.choose(response: early, unsolicited: early))
+        XCTAssertEqual(later.source, "POST_QUERY_MESSAGE_NO_TRANSACTION_ID")
+    }
+
+    func testConflictingBeforeAndAfterQueryCapabilitiesCannotSelectAProtocol() {
+        XCTAssertThrowsError(try VendorCapabilitySelection.choose(response: capability(version: 4),
+                                                                  unsolicited: capability(version: 3)))
+        XCTAssertThrowsError(try VendorCapabilitySelection.choose(response: capability(support: 0),
+                                                                  unsolicited: capability(support: 3)))
+    }
+
+    func testLatePreQueryAndCoalescedCapabilitiesParticipateBeforeCompletion() throws {
+        let selected = capability()
+        XCTAssertThrowsError(try VendorCapabilitySelection.validate(selected: selected, response: nil,
+            unsolicited: capability(version: 3), incoming: []))
+        XCTAssertThrowsError(try VendorCapabilitySelection.validate(selected: selected, response: selected,
+            unsolicited: nil, incoming: [selected, capability(support: 0)]))
+        XCTAssertThrowsError(try VendorCapabilitySelection.validate(selected: nil, response: nil,
+            unsolicited: nil, incoming: [selected, capability(version: 4)]))
+        XCTAssertNoThrow(try VendorCapabilitySelection.validate(selected: selected, response: selected,
+            unsolicited: selected, incoming: [selected, selected]))
+    }
+
+    func testAuthenticationFactsDoNotUpgradeBusinessBindingOrExposeProofs() throws {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.status = "AUTHENTICATED_BINDING_PENDING"
+        snapshot.vendorAuthentication = "PASSED"
+        snapshot.authentication.phase = .completed
+        snapshot.authentication.status = "PASSED"
+        snapshot.authentication.identityVerified = true
+        snapshot.authentication.keyExchangeVerified = true
+        snapshot.authentication.transportAuthenticated = true
+        let encoded = try JSONEncoder().encode(snapshot)
+        let restored = try JSONDecoder().decode(VendorProbeSnapshot.self, from: encoded)
+        XCTAssertEqual(restored, snapshot)
+        XCTAssertEqual(restored.accountBinding, "NOT_IMPLEMENTED")
+        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        for privateField in ["clientNonce", "watchNonce", "protobuf", "identityKey", "privateKey", "encryptedProof"] {
+            XCTAssertFalse(text.contains("\"" + privateField + "\""))
+        }
+    }
+
+    private func capability(version: Int = 5, support: UInt32 = 3) -> OppoTransportCapabilities {
+        OppoTransportCapabilities(protocolVersion: version, maxFrameSize: 20, maxTransmissionUnit: 20,
+                                  interval: 10, supportProtocol: support, commandID: 0x81, controlFlags: 0,
+                                  frameCount: 1, frameShape: "SINGLE_FRAME", crcValidation: "CRC16_LE_VERIFIED",
+                                  encodedFieldNumbers: [1, 2, 3, 4, 5])
     }
 }

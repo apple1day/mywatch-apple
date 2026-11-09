@@ -50,8 +50,13 @@ final class HomeUITests: XCTestCase {
         XCTAssertTrue(reportText.contains("schemaVersion"))
         XCTAssertTrue(reportText.contains("UNAVAILABLE_VIA_PUBLIC_IOS_API"))
         XCTAssertTrue(reportText.contains("NOT_IMPLEMENTED"))
-        XCTAssertTrue(reportText.contains("TRANSPORT_CAPABILITY_QUERY_ONLY"))
+        XCTAssertTrue(reportText.contains("TRANSPORT_AND_IDENTITY_VERIFICATION"))
         XCTAssertTrue(reportText.contains("NOT_OBSERVABLE_VIA_PUBLIC_CORE_BLUETOOTH_API"))
+        XCTAssertTrue(reportText.contains("EXPERIMENTAL_PROTOCOL_3_TO_5"))
+        // Native preview must expose a complete JSON snapshot, not an excerpt.
+        let reportData = try XCTUnwrap(reportText.data(using: .utf8))
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: reportData) as? [String: Any])
+        XCTAssertEqual(report["schemaVersion"] as? Int, 4)
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "WatchLink-first-report-snapshot"

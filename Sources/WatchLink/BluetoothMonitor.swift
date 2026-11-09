@@ -71,7 +71,10 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     private var deviceLimitReported = false
     private var vendorCharacteristics: [CBCharacteristic] = []
     private var vendorTransport: VendorGATTTransport?
-    private var vendorDecoder = OppoTransportDecoder()
+    private var vendorDecoder = OppoTransportDecoder(emitAuthenticationMessages: true)
+    private var authentication: OppoAuthentication?
+    private var activeVendorWriteIndex: Int?
+    private var activeAuthenticationToken: Int?
 
     var selectedDevice: DiscoveredDevice? {
         devices.first { $0.id == selectedDeviceID }
@@ -90,8 +93,16 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             && vendorProtocol.status == "NOT_ATTEMPTED"
     }
 
-    /// One capability query per GATT connection. A fresh connection is required to
-    /// retry, so a delayed ATT callback can never acknowledge a subsequent attempt.
+    var vendorCheckButtonTitle: String {
+        if vendorProtocol.status != "NOT_ATTEMPTED" { return vendorProtocol.checkButtonTitle }
+        if !isConnected { return "请先连接蓝牙" }
+        if phase != .ready { return "正在读取设备信息…" }
+        if !vendorProtocol.profileAvailable { return "未发现完整协议通道" }
+        return "验证连接与身份"
+    }
+
+    /// One complete verification session per GATT connection. All subsequent
+    /// identity commands are serialized behind real ATT completion callbacks.
     func checkVendorProtocol() {
         guard canCheckVendorProtocol, let peripheral,
               let write = vendorCharacteristic(service: OppoGATTProfile.commandService,
@@ -102,62 +113,230 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                                                uuid: OppoGATTProfile.fileNotify)
         let token = generation
         vendorDecoder.reset()
+        authentication?.cancel()
+        authentication = nil
+        activeVendorWriteIndex = nil
+        activeAuthenticationToken = nil
         vendorProtocol.status = "SUBSCRIBING"
         vendorProtocol.startedAt = Date()
         isCheckingVendorProtocol = true
         phase = .vendor
         result = "VENDOR_PROTOCOL_SUBSCRIBING"
         stateText = vendorProtocol.summary
-        addEvent("开始手表传输能力检查：先开启已核实的通知通道，再发送一次能力查询。系统配对状态无法由此直接读取。")
+        addEvent("开始连接与身份验证：先检查协议能力，再按手表实际版本验证本地身份。业务绑定和首次设置尚未实现。")
 
         let transport = VendorGATTTransport(
             peripheral: peripheral, commandWrite: write, commandNotify: notify, fileNotify: fileNotify,
             onReady: { [weak self] in
-                guard let self, self.generation == token, self.isCheckingVendorProtocol,
-                      let transport = self.vendorTransport else { return }
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
                 self.recordVendorNotifications()
-                self.vendorProtocol.status = "WAITING_FOR_RESPONSE"
-                // The byte stream and any message already in flight survive this
-                // boundary. Only a message beginning after it can be a response.
-                self.vendorDecoder.markQuerySubmitted()
-                self.vendorProtocol.requestSubmitted = true
-                self.vendorProtocol.querySubmittedAt = Date()
-                self.vendorProtocol.decoderDiagnostics = self.vendorDecoder.diagnostics
-                self.result = "VENDOR_PROTOCOL_WAITING_FOR_RESPONSE"
-                self.stateText = self.vendorProtocol.summary
-                self.addEvent("通知通道已开启，提交 TransportConsult 能力查询（服务 1 / 命令 1）。此消息不包含验证码、账号或绑定成功标记。")
-                self.setTimer(seconds: 45) { [weak self] in
-                    guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
-                    self.vendorProtocol.decoderDiagnostics = self.vendorDecoder.diagnostics
-                    let detail = self.vendorDecoder.diagnostics.lastIssue.map { " 最近接收情况：\($0)。" } ?? ""
-                    self.vendorProbeFailed(.init(phase: "PROTOCOL_RESPONSE", domain: "WatchLink.ProtocolProbe",
-                                                 code: 1001, message: self.vendorDecoder.hasPendingData
-                                                    ? "等待能力信息超时，接收流仍有未完成的消息。\(detail)"
-                                                    : "查询后未收到起点和内容均符合要求的能力信息。\(detail)"))
-                }
-                if !transport.send(fragments: [OppoProtocol.transportConsultRequest]) {
-                    self.vendorProtocol.requestSubmitted = false
-                    self.vendorProtocol.querySubmittedAt = nil
-                    if self.isCheckingVendorProtocol {
-                        self.vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
-                                                     code: 1002, message: "查询没有进入发送队列。"))
-                    }
-                }
+                self.beginVendorQuery()
             },
             onReceived: { [weak self] channel, data in
                 guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
                 self.receiveVendorData(channel, data: data)
             },
-            // The delegate records ATT completion independently of the active
-            // decoder, including callbacks received after a result or failure.
-            onWriteComplete: {},
+            onFragmentSubmitted: { [weak self] index in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                self.vendorFragmentSubmitted(index)
+            },
+            onWriteComplete: { [weak self] in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                self.vendorWriteCompleted()
+            },
             onFailure: { [weak self] error in
                 guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
-                self.vendorProbeFailed(error)
+                self.vendorTransportFailed(error)
             }
         )
         vendorTransport = transport
         transport.start()
+    }
+
+    private func beginVendorQuery() {
+        guard let transport = vendorTransport, transport.isReady else { return }
+        vendorProtocol.commandWrites.append(.init(commandID: 1, stage: "TRANSPORT_QUERY",
+                                                  frameCount: 1, queuedAt: Date()))
+        activeVendorWriteIndex = vendorProtocol.commandWrites.count - 1
+        activeAuthenticationToken = nil
+        if !transport.send(fragments: [OppoProtocol.transportConsultRequest], intervalMilliseconds: 10), isCheckingVendorProtocol {
+            vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                    code: 1002, message: "能力查询没有进入发送队列。"))
+        }
+    }
+
+    private func vendorFragmentSubmitted(_ fragmentIndex: Int) {
+        guard let index = activeVendorWriteIndex, vendorProtocol.commandWrites.indices.contains(index),
+              vendorProtocol.commandWrites[index].recordSubmission(index: fragmentIndex, at: Date()) else {
+            vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                    code: 1006, message: "发送分片与当前命令记录不一致。"))
+            return
+        }
+        guard fragmentIndex == 0 else { return }
+        if let token = activeAuthenticationToken, let authentication {
+            setTimer(seconds: 45) { [weak self] in
+                guard let self, self.isCheckingVendorProtocol, let authentication = self.authentication else { return }
+                self.handleAuthenticationActions(authentication.timeout())
+            }
+            handleAuthenticationActions(authentication.didSubmit(
+                token: token, streamOffset: vendorDecoder.diagnostics.receivedByteCount))
+        } else {
+            vendorDecoder.markQuerySubmitted()
+            vendorProtocol.requestSubmitted = true
+            vendorProtocol.querySubmittedAt = Date()
+            vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
+            vendorProtocol.status = "WAITING_FOR_RESPONSE"
+            result = "VENDOR_PROTOCOL_WAITING_FOR_RESPONSE"
+            stateText = vendorProtocol.summary
+            addEvent("已提交传输能力查询。取得完整能力并确认写入后，才会选择相应的身份流程。")
+            setTimer(seconds: 45) { [weak self] in
+                guard let self, self.isCheckingVendorProtocol, self.authentication == nil else { return }
+                let detail = self.vendorDecoder.diagnostics.lastIssue.map { " 最近接收情况：\($0)。" } ?? ""
+                self.vendorProbeFailed(.init(phase: "PROTOCOL_RESPONSE", domain: "WatchLink.ProtocolProbe",
+                                             code: 1001, message: self.vendorDecoder.hasPendingData
+                                                ? "等待能力信息超时，仍有未完成的消息。\(detail)"
+                                                : "未取得可用于身份认证的完整能力信息。\(detail)"))
+            }
+        }
+    }
+
+    private func vendorWriteCompleted() {
+        guard let index = activeVendorWriteIndex, vendorProtocol.commandWrites.indices.contains(index),
+              vendorProtocol.commandWrites[index].fullyAcknowledged else {
+            vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                    code: 1006, message: "命令完成回调与逐片写入记录不一致。"))
+            return
+        }
+        let token = activeAuthenticationToken
+        let commandID = vendorProtocol.commandWrites[index].commandID
+        activeVendorWriteIndex = nil
+        activeAuthenticationToken = nil
+        if let token, let authentication {
+            addEvent("身份流程命令 \(commandID) 的全部分片已收到 ATT 确认；设备协议校验单独判断。")
+            handleAuthenticationActions(authentication.writeCompleted(token: token, succeeded: true))
+        } else {
+            beginAuthenticationIfReady()
+        }
+    }
+
+    private func beginAuthenticationIfReady() {
+        guard isCheckingVendorProtocol, authentication == nil,
+              vendorProtocol.attWriteAcknowledged, activeVendorWriteIndex == nil,
+              let transport = vendorTransport, transport.isReady, !transport.isWriting else { return }
+        let choice: VendorCapabilitySelection.Choice
+        do {
+            guard let observed = try VendorCapabilitySelection.choose(
+                response: vendorProtocol.capabilities,
+                unsolicited: vendorDecoder.diagnostics.unsolicitedCapabilities) else { return }
+            choice = observed
+        } catch {
+            vendorProbeFailed(.init(phase: "CAPABILITY_VALIDATION", domain: "WatchLink.ProtocolProbe",
+                                    code: 2006, message: "查询前后的能力参数不一致，已停止选择身份流程。"))
+            return
+        }
+        let selected = choice.capabilities
+        let source = choice.source
+        cancelTimer()
+        vendorProtocol.authentication.selectedCapabilities = selected
+        vendorProtocol.authentication.capabilitySource = source
+        vendorProtocol.authentication.startedAt = Date()
+        vendorProtocol.authentication.status = "IN_PROGRESS"
+        vendorProtocol.vendorAuthentication = "IN_PROGRESS"
+        vendorProtocol.status = "AUTHENTICATING"
+        result = "VENDOR_AUTHENTICATING"
+        let engine = OppoAuthentication()
+        authentication = engine
+        addEvent("根据完整能力消息选择身份流程：协议版本 \(selected.protocolVersion)，来源 \(source)。前置主动能力不标为本次查询应答。")
+        handleAuthenticationActions(engine.start(capabilities: selected))
+    }
+
+    private func syncAuthenticationObservations() {
+        guard let authentication else { return }
+        vendorProtocol.authentication.phase = authentication.phase
+        vendorProtocol.authentication.diagnostics = authentication.diagnostics
+        vendorProtocol.authentication.identityVerified = authentication.identityVerified
+        vendorProtocol.authentication.keyExchangeVerified = authentication.keyExchangeVerified
+    }
+
+    private func handleAuthenticationActions(_ actions: [OppoAuthentication.Action],
+                                             transportFailure: VendorGATTTransport.Failure? = nil) {
+        syncAuthenticationObservations()
+        if isCheckingVendorProtocol { stateText = vendorProtocol.summary }
+        for action in actions {
+            guard isCheckingVendorProtocol else { return }
+            switch action {
+            case .send(let command):
+                sendAuthenticationCommand(command)
+            case .completed(let completion):
+                syncAuthenticationObservations()
+                vendorProtocol.authentication.status = "PASSED"
+                vendorProtocol.authentication.transportAuthenticated = true
+                vendorProtocol.authentication.completedAt = Date()
+                vendorProtocol.vendorAuthentication = "PASSED"
+                vendorProtocol.status = "AUTHENTICATED_BINDING_PENDING"
+                result = "TRANSPORT_AUTHENTICATED_BINDING_PENDING"
+                stateText = vendorProtocol.summary
+                isCheckingVendorProtocol = false
+                phase = .ready
+                cancelTimer()
+                recordVendorNotifications()
+                vendorTransport?.cancel()
+                authentication = nil
+                addEvent("已完成协议版本 \(completion.protocolVersion) 的传输身份验证；加密协商\(completion.encryptedTransport ? "已完成" : "未被手表要求")。业务绑定、首次设置和健康同步尚未执行。")
+            case .failed(let failure):
+                vendorProtocol.authentication.error = failure
+                vendorProbeFailed(transportFailure ?? .init(
+                    phase: "AUTH_" + failure.phase.rawValue.uppercased(), domain: "WatchLink.Authentication",
+                    code: 2001, message: "\(failure.code)：\(failure.message)"))
+            }
+        }
+    }
+
+    private func sendAuthenticationCommand(_ command: OppoAuthentication.Command) {
+        guard let transport = vendorTransport, transport.isReady, !transport.isWriting,
+              activeVendorWriteIndex == nil,
+              let capabilities = vendorProtocol.authentication.selectedCapabilities else {
+            vendorProbeFailed(.init(phase: "AUTH_COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                    code: 2002, message: "身份命令与当前写入状态不一致。"))
+            return
+        }
+        let frameLimit = min(min(20, capabilities.maxFrameSize),
+                             min(capabilities.maxTransmissionUnit, transport.maximumWriteLength))
+        guard (0...1000).contains(capabilities.interval) else {
+            vendorProbeFailed(.init(phase: "AUTH_TRANSPORT_LIMIT", domain: "WatchLink.ProtocolProbe",
+                                    code: 2003, message: "手表要求的发送间隔超过本版支持范围。"))
+            return
+        }
+        do {
+            let fragments = try OppoProtocol.encode(service: command.serviceID, command: command.commandID,
+                                                     protobuf: command.protobuf, maximumFrameLength: frameLimit)
+            guard vendorProtocol.commandWrites.count < 8 else {
+                throw OppoDecodeError.oversizedInput
+            }
+            vendorProtocol.commandWrites.append(.init(commandID: Int(command.commandID), stage: command.phase.rawValue,
+                                                      frameCount: fragments.count, queuedAt: Date()))
+            activeVendorWriteIndex = vendorProtocol.commandWrites.count - 1
+            activeAuthenticationToken = command.token
+            addEvent("开始\(vendorProtocol.authentication.phaseDescription)：命令 \(command.commandID)，\(fragments.count) 个分片。")
+            if !transport.send(fragments: fragments, intervalMilliseconds: max(10, capabilities.interval)),
+               isCheckingVendorProtocol {
+                vendorTransportFailed(.init(phase: "AUTH_COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                             code: 2004, message: "身份命令没有进入发送队列。"))
+            }
+        } catch {
+            vendorProbeFailed(.init(phase: "AUTH_FRAME_ENCODING", domain: "WatchLink.ProtocolProbe",
+                                    code: 2005, message: "当前帧长、ATT 限额或消息大小无法安全发送身份命令。"))
+        }
+    }
+
+    private func vendorTransportFailed(_ failure: VendorGATTTransport.Failure) {
+        if let authentication, let token = activeAuthenticationToken {
+            let actions = authentication.writeCompleted(token: token, succeeded: false)
+            handleAuthenticationActions(actions, transportFailure: failure)
+            if isCheckingVendorProtocol { vendorProbeFailed(failure) }
+        } else {
+            vendorProbeFailed(failure)
+        }
     }
 
     func startScan() {
@@ -222,14 +401,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     /// Call before showing the share sheet to preserve the current connection state.
     func makeReport() -> Data {
         let report = ProbeReport(
-            schemaVersion: 3,
+            schemaVersion: 4,
             generatedAt: Date(),
             platform: PlatformSnapshot(
                 system: UIDevice.current.systemName,
                 systemVersion: UIDevice.current.systemVersion,
                 deviceType: UIDevice.current.model,
-                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1",
-                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "3"
+                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0",
+                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "4"
             ),
             capabilities: CapabilitySnapshot(),
             selectedDevice: selectedDevice.map { DeviceSnapshot(device: $0, salt: sessionSalt) },
@@ -242,7 +421,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             services: serviceRows,
             standardReadings: readings,
             events: events,
-            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷、验证码、密钥或原始私有载荷。仅记录已校验的传输能力、有界帧头元数据、通道计数和错误信息。查询前开始的能力消息单独标注，不作为本次应答。设备名和标准设备信息仍可能识别你的设备。",
+            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷、验证码、密钥或原始私有载荷。仅记录传输能力、身份校验阶段与结果、逐命令写入计数及有界帧头。身份随机值、挑战、加密证明和会话密钥只在内存中处理，不写入报告。查询前能力单独标注来源，不作为查询应答。设备名和标准设备信息仍可能识别你的设备。",
             vendorProtocol: vendorProtocol
         )
         return report.encoded()
@@ -276,6 +455,17 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
             vendorProtocol.status = "INTERRUPTED"
         }
+        if let authentication {
+            authentication.cancel()
+            syncAuthenticationObservations()
+            if !vendorProtocol.authentication.transportAuthenticated {
+                vendorProtocol.authentication.status = "INTERRUPTED"
+                vendorProtocol.vendorAuthentication = "INTERRUPTED"
+            }
+        }
+        authentication = nil
+        activeVendorWriteIndex = nil
+        activeAuthenticationToken = nil
         isCheckingVendorProtocol = false
         vendorTransport?.cancel()
         vendorTransport = nil
@@ -549,11 +739,11 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             result = readings.contains(where: { $0.status == "READ_ERROR" })
                 ? "GATT_DIAGNOSTICS_PARTIAL" : "GATT_DIAGNOSTICS_COMPLETE"
             stateText = vendorProtocol.profileAvailable
-                ? "GATT 检测完成 · 可继续检查手表协议"
+                ? "GATT 检测完成 · 可继续验证连接与身份"
                 : "GATT 检测完成 · 未发现完整的手表协议通道"
             addEvent(readings.isEmpty ? "未发现可读取的标准电量／设备信息字段。没有标准字段不能单独证明不兼容。" : "已完成标准字段读取；没有执行私有认证、绑定或控制写入。")
             if vendorProtocol.profileAvailable {
-                addEvent("发现已核实 UUID 的命令写入与通知特征。可主动执行一次协议能力查询；特征存在不代表业务绑定已实现。")
+                addEvent("发现已核实 UUID 的命令写入与通知特征。可开始一次能力查询及身份验证；特征存在不代表业务绑定已实现。")
             }
             return
         }
@@ -594,18 +784,22 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                                                  error: Error?, token: Int) {
         guard current(device, token: token) else { return }
         if let expected = vendorCharacteristic(service: OppoGATTProfile.commandService,
-                                               uuid: OppoGATTProfile.commandWrite),
-           characteristic === expected {
+                                               uuid: OppoGATTProfile.commandWrite), characteristic === expected,
+           let index = activeVendorWriteIndex, vendorProtocol.commandWrites.indices.contains(index) {
             let failure = error.map { error -> VendorGATTTransport.Failure in
                 let detail = error as NSError
                 return .init(phase: "COMMAND_WRITE", domain: detail.domain, code: detail.code,
-                             message: "能力查询的 ATT 写入回调返回错误：\(detail.localizedDescription)")
+                             message: "ATT 写入回调返回错误：\(detail.localizedDescription)")
             }
-            if vendorProtocol.recordWriteCompletion(error: failure, at: Date()) {
-                addEvent(failure.map { "已记录能力查询的 ATT 写入错误：\($0.description)。协议检查结果单独保留。" }
-                         ?? "已记录能力查询的 ATT 写入确认；该事实不表示手表身份认证或业务绑定完成。")
+            if vendorProtocol.commandWrites[index].recordCallback(error: failure, at: Date()),
+               vendorProtocol.commandWrites[index].commandID == 1 {
+                if vendorProtocol.recordWriteCompletion(error: failure, at: Date()) {
+                    addEvent(failure == nil ? "能力查询的 ATT 写入已确认。" : "能力查询的 ATT 写入返回错误。")
+                }
             }
         }
+        // Receipt facts above survive local protocol cancellation. Only the live
+        // transport can finish a logical command and advance authentication.
         vendorTransport?.writeCompleted(device, characteristic: characteristic, error: error)
     }
 
@@ -624,50 +818,73 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func receiveVendorData(_ channel: VendorGATTTransport.Channel, data: Data) {
-        // Continuous unsolicited traffic must not consume the old 64-packet
-        // budget before a response can arrive. Keep a bounded lifetime budget;
-        // the decoder separately bounds buffered bytes and assembled messages.
         guard vendorProtocol.notificationCount < 4096,
               data.count <= 256 * 1024 - vendorProtocol.receivedByteCount else {
             vendorProbeFailed(.init(phase: "PROTOCOL_RECEIVE", domain: "WatchLink.ProtocolProbe",
-                                    code: 1003, message: "本次协议检查已达到接收数量或长度上限。"))
+                                    code: 1003, message: "本次验证已达到接收数量或长度上限。"))
             return
         }
         vendorProtocol.recordNotification(channel: channel, byteCount: data.count)
-        // File data is counted, but never interpreted, persisted, or acknowledged as
-        // a command response. No file transfer is requested by this application.
+        // File notifications are counted, never interpreted as identity replies.
         guard channel == .command else { return }
         let decodedEvents = vendorDecoder.append(data)
         vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
-        if vendorProtocol.status == "WAITING_FOR_RESPONSE" { stateText = vendorProtocol.summary }
+        let incomingCapabilities = decodedEvents.compactMap { event -> OppoTransportCapabilities? in
+            if case .capabilities(let value) = event { return value }
+            return nil
+        }
+        do {
+            try VendorCapabilitySelection.validate(
+                selected: vendorProtocol.authentication.selectedCapabilities,
+                response: vendorProtocol.capabilities,
+                unsolicited: vendorDecoder.diagnostics.unsolicitedCapabilities,
+                incoming: incomingCapabilities)
+        } catch {
+            if let newest = incomingCapabilities.last {
+                vendorProtocol.capabilities = newest
+                vendorProtocol.responseAt = Date()
+                vendorProtocol.responseCorrelation = "MESSAGE_STARTED_AFTER_QUERY_NO_TRANSACTION_ID"
+            }
+            vendorProbeFailed(.init(phase: "CAPABILITY_VALIDATION", domain: "WatchLink.ProtocolProbe",
+                                    code: 2006, message: "同一连接中的完整能力消息参数冲突，已停止身份验证。"))
+            return
+        }
         for event in decodedEvents {
+            guard isCheckingVendorProtocol else { return }
             switch event {
             case .capabilities(let capabilities):
                 vendorProtocol.capabilities = capabilities
                 vendorProtocol.responseAt = Date()
                 vendorProtocol.responseCorrelation = "MESSAGE_STARTED_AFTER_QUERY_NO_TRANSACTION_ID"
-                vendorProtocol.status = "CAPABILITIES_RECEIVED_AUTH_PENDING"
-                recordVendorNotifications()
-                cancelTimer()
-                isCheckingVendorProtocol = false
-                phase = .ready
-                result = "VENDOR_CAPABILITIES_RECEIVED_AUTH_PENDING"
-                stateText = vendorProtocol.summary
-                addEvent("收到查询提交后开始、通过帧与校验验证的能力消息：协议版本 \(capabilities.protocolVersion)，帧长 \(capabilities.maxFrameSize)，传输单元 \(capabilities.maxTransmissionUnit)。协议没有请求流水号；尚未执行后续身份认证与业务绑定。")
-                vendorTransport?.cancel()
-                return
+                if authentication == nil {
+                    vendorProtocol.status = "CAPABILITIES_WAITING_FOR_WRITE"
+                    addEvent("已取得完整有效的协议能力消息，等待查询写入完成后进入身份验证。")
+                    beginAuthenticationIfReady()
+                }
+            case .message(let message):
+                if let authentication { handleAuthenticationActions(authentication.receive(message)) }
             case .rejected(let error):
                 vendorProbeFailed(.init(phase: "PROTOCOL_DECODE", domain: "WatchLink.OppoProtocol",
-                                        code: 1004, message: "协商回应未通过验证：\(error.diagnosticMessage)"))
-                return
+                                        code: 1004, message: "协议接收停止：\(error.diagnosticMessage)"))
             }
         }
+        guard isCheckingVendorProtocol else { return }
+        beginAuthenticationIfReady()
+        stateText = vendorProtocol.summary
     }
 
     private func vendorProbeFailed(_ error: VendorGATTTransport.Failure) {
         recordVendorNotifications()
         _ = vendorDecoder.finish()
         vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
+        if let authentication {
+            syncAuthenticationObservations()
+            vendorProtocol.authentication.status = "FAILED"
+            vendorProtocol.authentication.phase = .failed
+            vendorProtocol.vendorAuthentication = "FAILED"
+            authentication.cancel()
+        }
+        authentication = nil
         vendorProtocol.status = "FAILED"
         vendorProtocol.error = error
         isCheckingVendorProtocol = false
@@ -675,9 +892,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         vendorTransport?.cancel()
         vendorDecoder.reset()
         phase = isConnected ? .ready : .idle
-        result = "VENDOR_PROTOCOL_QUERY_FAILED"
+        result = "VENDOR_VERIFICATION_FAILED"
         stateText = vendorProtocol.summary
-        addEvent("手表协议检查停止：\(error.description)。请导出报告；重新检查前先断开并重连。")
+        addEvent("连接验证停止：\(error.description)。本次结果已保留；重新验证前请先断开并重连。")
     }
 
     private static func propertyLabels(_ properties: CBCharacteristicProperties) -> [String] {

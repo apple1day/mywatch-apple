@@ -88,7 +88,7 @@ struct ContentView: View {
                 Text("一代手表连接")
                     .font(.title.bold())
                     .accessibilityIdentifier("homeTitle")
-                Text("iPhone 连接验证版 · 0.2.1")
+                Text("iPhone 连接验证版 · 0.3.0")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Text("发现设备，记录真实的连接结果。")
@@ -103,13 +103,13 @@ struct ContentView: View {
         WatchCard {
             Label("先了解 iOS 的连接范围", systemImage: "info.circle.fill")
                 .font(.headline)
-            Text("本版可检查蓝牙连接与手表的协议回应。手机确认验证码后，手表仍可能等待应用完成身份认证和绑定；当前尚未实现这两个后续步骤。")
+            Text("本版会先查询手表协议能力，再尝试对应的传输身份认证与必要的加密协商。业务绑定和首次设置尚未实现，手表仍可能停在配对页面。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("compatibilityNotice")
             HStack(spacing: 8) {
-                StatusTag(text: "BLE 协议检查", symbol: "wave.3.right", highlighted: true)
+                StatusTag(text: "传输身份验证", symbol: "wave.3.right", highlighted: true)
                 StatusTag(text: "业务绑定未适配", symbol: "lock")
             }
         }
@@ -186,13 +186,13 @@ struct ContentView: View {
 
     private var selectedCard: some View {
         WatchCard {
-            Label("当前设备", systemImage: "checkmark.circle")
+            Label("已选择的设备", systemImage: "applewatch")
                 .font(.headline)
             Text(monitor.selectedDevice?.name ?? "未选择设备")
                 .font(.title3.weight(.semibold))
                 .textSelection(.enabled)
             if monitor.isConnected {
-                Text("蓝牙通道已连接 · 原厂绑定尚未验证")
+                Text("蓝牙通道已连接 · 业务绑定尚未实现")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
             }
@@ -212,7 +212,7 @@ struct ContentView: View {
                 .disabled(!monitor.canConnect)
                 .accessibilityIdentifier("connectButton")
             }
-            Text("连接后先读取标准设备信息，再可检查手表的协议回应。进入后台会释放连接。健康同步、手机通知同步、表盘和原厂绑定尚未实现。")
+            Text("选中设备仅表示操作对象已确定。连接后可读取标准信息，并继续验证传输身份。进入后台会释放连接；业务绑定、首次设置和健康同步尚未实现。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -220,58 +220,91 @@ struct ContentView: View {
 
     private var bindingCard: some View {
         WatchCard {
-            Label("配对与绑定", systemImage: "lock.open")
+            Label("连接验证进度", systemImage: "list.bullet")
                 .font(.headline)
+            verificationRow("蓝牙通道", state: monitor.isConnected ? "已连接" : "尚未连接",
+                            complete: monitor.isConnected)
+            verificationRow("协议能力", state: observedCapabilities == nil ? "等待结果" : "已取得",
+                            complete: observedCapabilities != nil)
+            verificationRow("传输身份", state: authenticationLabel,
+                            complete: monitor.vendorProtocol.authentication.transportAuthenticated)
+            verificationRow("业务绑定与首次设置", state: "尚未实现", complete: false)
+            Divider()
             Text(monitor.vendorProtocol.summary)
                 .font(.subheadline.weight(.medium))
                 .accessibilityIdentifier("vendorProtocolState")
-            Text("系统验证码由 iOS 处理，App 无法直接读取系统配对是否完成。手表停在确认页面时，可检查它是否回应后续协议查询。")
+            Text("系统验证码由 iOS 处理。下面的验证会根据手表返回的协议继续交换身份信息；身份认证通过仍不等于业务绑定完成。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Button { monitor.checkVendorProtocol() } label: {
-                Label(monitor.isCheckingVendorProtocol ? "正在检查手表协议…" : "检查手表协议",
-                      systemImage: "arrow.left.arrow.right")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
+                HStack {
+                    if monitor.isCheckingVendorProtocol { ProgressView() }
+                    Text(monitor.vendorCheckButtonTitle)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
             }
             .buttonStyle(.borderedProminent)
             .disabled(!monitor.canCheckVendorProtocol)
             .accessibilityIdentifier("checkVendorProtocolButton")
-            if monitor.vendorProtocol.notificationCount > 0 {
-                Text("收到手表通知：命令 \(monitor.vendorProtocol.commandNotificationCount) 条 · 文件 \(monitor.vendorProtocol.fileNotificationCount) 条")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            if monitor.vendorProtocol.requestSubmitted {
-                Text(monitor.vendorProtocol.attWriteCallbackObserved
-                     ? (monitor.vendorProtocol.attWriteAcknowledged ? "蓝牙写入回执：已确认" : "蓝牙写入回执：返回错误，详见报告")
-                     : "蓝牙写入回执：尚未收到")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let capabilities = monitor.vendorProtocol.capabilities {
-                Text("手表返回的协议版本：\(capabilities.protocolVersion)")
+            if let capabilities = observedCapabilities {
+                Text("手表协议版本：\(capabilities.protocolVersion)")
                     .font(.subheadline)
-                Text("已记录协议能力，下一步仍需按手表回应实现身份认证和绑定。请导出本次报告。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } else if let failure = monitor.vendorProtocol.error {
+                if monitor.vendorProtocol.authentication.capabilitySource == "PRE_QUERY_OBSERVATION" {
+                    Text("身份流程使用手表主动宣告的完整能力；本次查询是否收到应答在报告中单独记录。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if monitor.vendorProtocol.notificationCount > 0 {
+                Text("收到手表消息：命令 \(monitor.vendorProtocol.commandNotificationCount) 条 · 文件 \(monitor.vendorProtocol.fileNotificationCount) 条")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if let last = monitor.vendorProtocol.commandWrites.last {
+                Text("当前命令写入：\(last.acknowledgedFragments)/\(last.frameCount) 个分片已确认")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            if let failure = monitor.vendorProtocol.error {
                 Text(failure.message)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .font(.footnote).foregroundStyle(.red)
+                    .accessibilityIdentifier("verificationFailure")
             }
-            if monitor.vendorProtocol.capabilities == nil,
-               let observed = monitor.vendorProtocol.decoderDiagnostics.unsolicitedCapabilities {
-                Text("查询前开始的消息包含协议版本 \(observed.protocolVersion)，已单独记录。本次查询的应答状态另行判断。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            if !monitor.isCheckingVendorProtocol, monitor.vendorProtocol.status != "NOT_ATTEMPTED" {
+                Button("导出本次验证结果") {
+                    reportSnapshot = ReportSnapshot(data: monitor.makeReport())
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("exportVerificationReportButton")
+                Text("本次连接的验证已结束。重新验证前请先断开并重连。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            Text(monitor.vendorProtocol.status == "NOT_ATTEMPTED"
-                 ? "这一步只查询传输能力，不代表绑定完成。出现系统配对提示时，请核对两端数字并完成确认。"
-                 : "每次连接只检查一次。可随时断开；重新检查前请先断开并重连，之后导出 JSON。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
+    }
+
+    private var observedCapabilities: OppoTransportCapabilities? {
+        monitor.vendorProtocol.capabilities ?? monitor.vendorProtocol.authentication.selectedCapabilities
+            ?? monitor.vendorProtocol.decoderDiagnostics.unsolicitedCapabilities
+    }
+
+    private var authenticationLabel: String {
+        switch monitor.vendorProtocol.vendorAuthentication {
+        case "PASSED": return "已通过"
+        case "IN_PROGRESS": return "正在验证"
+        case "FAILED": return "未通过"
+        case "INTERRUPTED": return "已中断"
+        default: return "尚未开始"
+        }
+    }
+
+    private func verificationRow(_ title: String, state: String, complete: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: complete ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(complete ? WatchColors.accent : Color.secondary)
+                .accessibilityHidden(true)
+            Text(title)
+            Spacer(minLength: 8)
+            Text(state).foregroundStyle(.secondary)
+        }
+        .font(.subheadline)
     }
 
     private var readingsCard: some View {
@@ -418,21 +451,21 @@ private struct GuideView: View {
                     Text("1. 让手表亮屏，靠近手机，保留现有绑定和数据。")
                     Text("2. 点击扫描，允许蓝牙权限。没有候选时，打开“显示其他设备”。")
                     Text("3. 选中设备，点击“连接 GATT 并读取标准信息”。")
-                    Text("4. 在“配对与绑定”中点击“检查手表协议”，完成可能出现的系统配对提示。")
-                    Text("5. 等待协议回应或错误，再导出 JSON 报告。协议回应不代表业务绑定成功。")
+                    Text("4. 在“连接验证进度”中点击“验证连接与身份”，完成可能出现的系统配对提示。")
+                    Text("5. 保持前台，等待身份验证结果或明确错误，再导出 JSON。认证通过仍不代表业务绑定成功。")
                 }
                 Section("手机已确认，手表仍等待") {
                     Text("系统蓝牙配对、手表协议认证和业务绑定是不同阶段。标准信息能读取，不能证明后两步已完成，也不能直接证明系统已经持久保存配对。")
-                    Text("0.2.1 修复了接收早期通知与孤立分片时过早停止的问题。命令数据从订阅开始持续解析，查询前的消息单独记录；后续身份认证与绑定尚未实现。")
+                    Text("0.3.0 会按完整能力消息选择身份流程。协议版本 3–5 可尝试身份挑战及必要的密钥协商；版本 1–2 会明确停止并记录旧密钥路径尚未适配。")
                     Text("系统配对提示不一定每次连接都出现。应根据命令通知、写入回执和协议结果判断当前进展；手表没有再次显示六位码，不能单独判断蓝牙是否连接。")
                 }
                 Section("为什么和安卓不同") {
-                    Text("安卓验证版能够尝试一代的自定义 RFCOMM 双通道，普通 iOS App 没有直接对应的公共接口。实表报告已确认另一组 BLE 命令特征存在，本版据此增加了协议能力检查。")
+                    Text("安卓验证版能够尝试一代的自定义 RFCOMM 双通道，普通 iOS App 没有直接对应的公共接口。实表报告已确认另一组 BLE 命令特征存在，本版据此尝试能力查询及传输身份认证。")
                     Text("CoreBluetooth 对经典蓝牙的支持是 GATT over BR/EDR，不等于开放任意串口通道。当前也没有这块国行一代提供可用 MFi 协议的证据。")
                     Text("未发现广播、没有标准电量、GATT 连接失败，都不能单独证明手表不兼容。服务存在也不代表该固件支持完整的 BLE 业务绑定，仍需实际回包。")
                 }
                 Section("报告和隐私") {
-                    Text("报告包含所选设备名称、会话匿名标识、系统版本、服务 UUID、传输能力和连接记录。不保存原始广播载荷、完整外设标识、验证码、密钥或原始私有载荷。iOS 不向本应用提供蓝牙 MAC 地址。")
+                    Text("报告包含所选设备名称、会话匿名标识、系统版本、服务 UUID、传输能力、身份校验结果和逐命令写入计数。不保存原始广播载荷、完整外设标识、验证码、密钥或原始私有载荷。iOS 不向本应用提供蓝牙 MAC 地址。")
                     Text("报告只在你导出时保存到指定位置。本应用不包含账号、分析 SDK 或网络上传功能。")
                     Text("进入后台会结束扫描并释放连接；返回后请手动重试。导出按钮先生成快照，再打开保存界面。")
                 }

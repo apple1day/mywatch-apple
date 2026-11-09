@@ -53,6 +53,7 @@ final class VendorGATTTransport {
     private let fileNotify: CBCharacteristic?
     private let onReady: () -> Void
     private let onReceived: (Channel, Data) -> Void
+    private let onFragmentSubmitted: (Int) -> Void
     private let onWriteComplete: () -> Void
     private let onFailure: (Failure) -> Void
 
@@ -64,6 +65,11 @@ final class VendorGATTTransport {
     private var outgoingFragmentsAccepted = 0
     private var outgoingBytesAccepted = 0
     private var awaitingWriteAcknowledgement = false
+    private var writeInterval: TimeInterval = 0
+    private var lastWriteCompletionUptime: TimeInterval?
+    private var nextWriteEarliestUptime: TimeInterval = 0
+    private var pacingWork: DispatchWorkItem?
+    private var pacingGeneration = 0
     private var deadline: DispatchWorkItem?
     private var deadlineGeneration: UInt64 = 0
 
@@ -85,6 +91,7 @@ final class VendorGATTTransport {
          fileNotify: CBCharacteristic? = nil,
          onReady: @escaping () -> Void,
          onReceived: @escaping (Channel, Data) -> Void,
+         onFragmentSubmitted: @escaping (Int) -> Void = { _ in },
          onWriteComplete: @escaping () -> Void,
          onFailure: @escaping (Failure) -> Void) {
         self.peripheral = peripheral
@@ -93,11 +100,12 @@ final class VendorGATTTransport {
         self.fileNotify = fileNotify
         self.onReady = onReady
         self.onReceived = onReceived
+        self.onFragmentSubmitted = onFragmentSubmitted
         self.onWriteComplete = onWriteComplete
         self.onFailure = onFailure
     }
 
-    deinit { deadline?.cancel() }
+    deinit { deadline?.cancel(); pacingWork?.cancel() }
 
     /// Idempotent: a failed or cancelled instance cannot be restarted.
     func start() {
@@ -132,9 +140,13 @@ final class VendorGATTTransport {
     /// Returns false without sending if not ready or another message is in flight.
     /// Validation failures terminate this transport and report onFailure.
     @discardableResult
-    func send(fragments: [Data]) -> Bool {
+    func send(fragments: [Data], intervalMilliseconds: Int = 0) -> Bool {
         requireMainThread()
         guard state == .ready, !isWriting else { return false }
+        guard (0...1000).contains(intervalMilliseconds) else {
+            reject(phase: "COMMAND_WRITE", code: 9, message: "手表要求的发送间隔超过本版支持范围。")
+            return false
+        }
         let maximumLength = maximumWriteLength
         guard maximumLength > 0 else {
             reject(phase: "COMMAND_WRITE", code: 1, message: "GATT 连接已不可用于写入。")
@@ -159,7 +171,8 @@ final class VendorGATTTransport {
         outgoingBytesAccepted += total
         outgoing = fragments
         outgoingIndex = 0
-        writeNext()
+        writeInterval = Double(intervalMilliseconds) / 1000
+        scheduleNextFragment()
         return true
     }
 
@@ -232,6 +245,9 @@ final class VendorGATTTransport {
         cancelDeadline()
         awaitingWriteAcknowledgement = false
         if let error { fail(phase: "COMMAND_WRITE", error: error); return }
+        let completedAt = ProcessInfo.processInfo.systemUptime
+        lastWriteCompletionUptime = completedAt
+        nextWriteEarliestUptime = completedAt + writeInterval
         outgoingIndex += 1
         if outgoingIndex == outgoing.count {
             outgoing = []
@@ -239,8 +255,29 @@ final class VendorGATTTransport {
             // ATT completion is deliberately separate from the protocol reply.
             onWriteComplete()
         } else {
-            writeNext()
+            scheduleNextFragment()
         }
+    }
+
+    private func scheduleNextFragment() {
+        let now = ProcessInfo.processInfo.systemUptime
+        // Preserve the interval across logical commands as well as fragments.
+        // A capability update may require a longer interval for the next command.
+        let earliest = max(nextWriteEarliestUptime,
+                           lastWriteCompletionUptime.map { $0 + writeInterval } ?? now)
+        let delay = max(0, earliest - now)
+        pacingGeneration += 1
+        pacingWork?.cancel()
+        pacingWork = nil
+        guard delay > 0 else { writeNext(); return }
+        let revision = pacingGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.pacingGeneration == revision, self.state == .ready else { return }
+            self.pacingWork = nil
+            self.writeNext()
+        }
+        pacingWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func subscribeNext() {
@@ -279,6 +316,10 @@ final class VendorGATTTransport {
         awaitingWriteAcknowledgement = true
         setDeadline(seconds: 20, phase: "COMMAND_WRITE", code: 8,
                     message: "等待 ATT 写入确认超时；未认定设备协议响应成功。")
+        // The owner marks the receive-stream boundary at the actual first write,
+        // not when a command was produced or queued for a later ATT operation.
+        onFragmentSubmitted(outgoingIndex)
+        guard state == .ready, awaitingWriteAcknowledgement else { return }
         peripheral.writeValue(outgoing[outgoingIndex], for: commandWrite, type: .withResponse)
     }
 
@@ -324,6 +365,9 @@ final class VendorGATTTransport {
 
     private func clearPendingWork() {
         cancelDeadline()
+        pacingGeneration += 1
+        pacingWork?.cancel()
+        pacingWork = nil
         subscriptionQueue = []
         expectedSubscription = nil
         outgoing = []

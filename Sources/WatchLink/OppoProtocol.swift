@@ -1,9 +1,8 @@
 import Foundation
 
-/// A deliberately narrow implementation of the APK's unencrypted transport
-/// capability query. No identity, key, pairing, account or control commands exist
-/// here. The wire description was independently reconstructed from ps0.g,
-/// dt0.a and ConsultProto.TransportConsult in the supplied APK.
+/// Clear transport framing reconstructed from ps0.g and dt0.a in the supplied
+/// APK. Authentication payloads are interpreted by the separate state machine;
+/// this layer never treats receipt of a frame as authentication or binding.
 enum OppoProtocol {
     /// sid=1, cid=1; protobuf version=5, frame=20, MTU=20, interval=10,
     /// supportProtocol=3. The final two bytes are CRC16 in little-endian order.
@@ -16,6 +15,67 @@ enum OppoProtocol {
         crc16(bytes: data)
     }
 
+    /// `maximumFrameLength` bounds the whole TL frame, including SOF, length,
+    /// control, optional FSN and CRC. The APK starts each message's FSN at zero.
+    /// Timing and ATT limits belong to the caller, not the wire codec. Only
+    /// clear outer framing is emitted; cipher text may be a protobuf bytes field.
+    static func encode(service: UInt8, command: UInt8, protobuf: Data,
+                       maximumFrameLength: Int, startingSequence: UInt8 = 0) throws -> [Data] {
+        guard (8...(OppoTransportDecoder.maximumFrameBodyLength + 5)).contains(maximumFrameLength) else {
+            throw OppoWireError.invalidFrameLimit
+        }
+        guard protobuf.count <= OppoProtobufReader.maximumEncodedLength else {
+            throw OppoWireError.messageTooLarge
+        }
+        let payload = [service, command] + Array(protobuf)
+        let singleCapacity = payloadCapacity(frameLimit: maximumFrameLength, controlLength: 2)
+        if payload.count <= singleCapacity {
+            return [frame(payload: payload[...], control: 0, sequence: nil)]
+        }
+
+        let fragmentCapacity = payloadCapacity(frameLimit: maximumFrameLength, controlLength: 3)
+        let frameCount = (payload.count + fragmentCapacity - 1) / fragmentCapacity
+        guard frameCount <= OppoTransportDecoder.maximumFragmentCount else {
+            throw OppoWireError.tooManyFragments
+        }
+        var frames: [Data] = []
+        for index in 0..<frameCount {
+            let start = index * fragmentCapacity
+            let end = min(start + fragmentCapacity, payload.count)
+            let control: UInt8 = index == 0 ? 1 : (index == frameCount - 1 ? 3 : 2)
+            let sequence = startingSequence &+ UInt8(truncatingIfNeeded: index)
+            frames.append(frame(payload: payload[start..<end], control: control, sequence: sequence))
+        }
+        return frames
+    }
+
+    private static func payloadCapacity(frameLimit: Int, controlLength: Int) -> Int {
+        // One-byte length covers body <=127. A two-byte length is used only
+        // when the body actually needs it, including the 131/132-byte boundary.
+        let short = min(127 - controlLength, frameLimit - 4 - controlLength)
+        let long = min(OppoTransportDecoder.maximumFrameBodyLength - controlLength,
+                       frameLimit - 5 - controlLength)
+        return long + controlLength >= 128 ? max(short, long) : short
+    }
+
+    private static func frame(payload: ArraySlice<UInt8>, control: UInt8, sequence: UInt8?) -> Data {
+        let bodyLength = 2 + (sequence == nil ? 0 : 1) + payload.count
+        var bytes: [UInt8] = [0xaa]
+        if bodyLength < 128 {
+            bytes.append(UInt8(bodyLength))
+        } else {
+            bytes.append(UInt8(bodyLength & 0x7f) | 0x80)
+            bytes.append(UInt8(bodyLength >> 7))
+        }
+        bytes.append(contentsOf: [control, 0])
+        if let sequence { bytes.append(sequence) }
+        bytes.append(contentsOf: payload)
+        let checksum = crc16(bytes: bytes)
+        bytes.append(UInt8(checksum & 0xff))
+        bytes.append(UInt8(checksum >> 8))
+        return Data(bytes)
+    }
+
     fileprivate static func crc16<S: Sequence>(bytes: S) -> UInt16 where S.Element == UInt8 {
         var crc: UInt16 = 0
         for byte in bytes {
@@ -26,6 +86,195 @@ enum OppoProtocol {
         }
         return crc
     }
+}
+
+enum OppoWireError: String, Error, Equatable {
+    case invalidFrameLimit = "INVALID_FRAME_LIMIT"
+    case messageTooLarge = "MESSAGE_TOO_LARGE"
+    case tooManyFragments = "TOO_MANY_FRAGMENTS"
+}
+
+enum OppoProtobufWireType: UInt8 {
+    case varint = 0
+    case bytes = 2
+}
+
+enum OppoProtobufValue: Equatable {
+    case varint(UInt64)
+    case bytes(Data)
+}
+
+/// Errors contain field numbers and validation reasons, never field values.
+enum OppoProtobufError: Error, Equatable {
+    case messageTooLarge
+    case tooManyFields
+    case invalidFieldNumber
+    case unsupportedWireType(UInt8)
+    case wrongWireType(field: Int)
+    case duplicateField(Int)
+    case truncatedInput
+    case varintOverflow
+    case noncanonicalVarint
+    case integerOutOfRange(field: Int)
+}
+
+/// A bounded protobuf wire reader for the authentication schemas. Known fields
+/// must have the declared type and appear at most once. Unknown ordinary wire
+/// fields can be skipped, but groups and malformed encodings are rejected.
+struct OppoProtobufReader {
+    static let maximumEncodedLength = OppoTransportDecoder.maximumMessageLength - 2
+    static let maximumFieldCount = 64
+    private let values: [Int: OppoProtobufValue]
+
+    var presentFieldNumbers: [Int] { values.keys.sorted() }
+
+    init(_ data: Data, fields: [Int: OppoProtobufWireType]) throws {
+        guard data.count <= Self.maximumEncodedLength else { throw OppoProtobufError.messageTooLarge }
+        guard fields.count <= Self.maximumFieldCount else { throw OppoProtobufError.tooManyFields }
+        guard fields.keys.allSatisfy({ (1...0x1fff_ffff).contains($0) }) else {
+            throw OppoProtobufError.invalidFieldNumber
+        }
+        var cursor = Cursor(bytes: Array(data))
+        var decoded: [Int: OppoProtobufValue] = [:]
+        var fieldCount = 0
+        while !cursor.isAtEnd {
+            fieldCount += 1
+            guard fieldCount <= Self.maximumFieldCount else { throw OppoProtobufError.tooManyFields }
+            let tag = try cursor.varint()
+            let number = tag >> 3
+            guard number > 0, number <= 0x1fff_ffff else { throw OppoProtobufError.invalidFieldNumber }
+            let field = Int(number)
+            let wire = UInt8(tag & 7)
+            if let expected = fields[field] {
+                guard wire == expected.rawValue else { throw OppoProtobufError.wrongWireType(field: field) }
+                guard decoded[field] == nil else { throw OppoProtobufError.duplicateField(field) }
+            }
+            switch wire {
+            case 0:
+                let value = try cursor.varint()
+                if fields[field] != nil { decoded[field] = .varint(value) }
+            case 1:
+                try cursor.skip(8)
+            case 2:
+                let length = try cursor.varint()
+                guard length <= UInt64(cursor.remaining) else { throw OppoProtobufError.truncatedInput }
+                let count = Int(length)
+                if fields[field] != nil { decoded[field] = .bytes(cursor.data(count: count)) }
+                try cursor.skip(count)
+            case 5:
+                try cursor.skip(4)
+            default:
+                throw OppoProtobufError.unsupportedWireType(wire)
+            }
+        }
+        values = decoded
+    }
+
+    func uint64(_ field: Int) throws -> UInt64? {
+        guard let value = values[field] else { return nil }
+        guard case .varint(let integer) = value else { throw OppoProtobufError.wrongWireType(field: field) }
+        return integer
+    }
+
+    func uint32(_ field: Int) throws -> UInt32? {
+        guard let value = try uint64(field) else { return nil }
+        guard value <= UInt64(UInt32.max) else { throw OppoProtobufError.integerOutOfRange(field: field) }
+        return UInt32(value)
+    }
+
+    func bytes(_ field: Int) throws -> Data? {
+        guard let value = values[field] else { return nil }
+        guard case .bytes(let bytes) = value else { throw OppoProtobufError.wrongWireType(field: field) }
+        return bytes
+    }
+
+    private struct Cursor {
+        let bytes: [UInt8]
+        var offset = 0
+        var remaining: Int { bytes.count - offset }
+        var isAtEnd: Bool { remaining == 0 }
+
+        mutating func varint() throws -> UInt64 {
+            var value: UInt64 = 0
+            for index in 0..<10 {
+                guard remaining > 0 else { throw OppoProtobufError.truncatedInput }
+                let byte = bytes[offset]
+                offset += 1
+                if index == 9, byte > 1 { throw OppoProtobufError.varintOverflow }
+                value |= UInt64(byte & 0x7f) << (index * 7)
+                if byte & 0x80 == 0 {
+                    guard index == 0 || byte != 0 else { throw OppoProtobufError.noncanonicalVarint }
+                    return value
+                }
+            }
+            throw OppoProtobufError.varintOverflow
+        }
+
+        mutating func skip(_ count: Int) throws {
+            guard count >= 0, count <= remaining else { throw OppoProtobufError.truncatedInput }
+            offset += count
+        }
+
+        func data(count: Int) -> Data { Data(bytes[offset..<(offset + count)]) }
+    }
+}
+
+enum OppoProtobufWriter {
+    /// Fields are emitted in field-number order. Explicit zero/empty values are
+    /// preserved; omitting a proto3 default is the caller's schema decision.
+    static func encode(_ fields: [Int: OppoProtobufValue]) throws -> Data {
+        guard fields.count <= OppoProtobufReader.maximumFieldCount else { throw OppoProtobufError.tooManyFields }
+        var result: [UInt8] = []
+        for field in fields.keys.sorted() {
+            guard (1...0x1fff_ffff).contains(field) else { throw OppoProtobufError.invalidFieldNumber }
+            guard let value = fields[field] else { continue }
+            var prefix: [UInt8]
+            let payload: Data
+            switch value {
+            case .varint(let integer):
+                prefix = varint(UInt64(field) << 3)
+                prefix.append(contentsOf: varint(integer))
+                payload = Data()
+            case .bytes(let bytes):
+                guard bytes.count <= OppoProtobufReader.maximumEncodedLength else { throw OppoProtobufError.messageTooLarge }
+                prefix = varint((UInt64(field) << 3) | 2)
+                prefix.append(contentsOf: varint(UInt64(bytes.count)))
+                payload = bytes
+            }
+            guard result.count + prefix.count + payload.count <= OppoProtobufReader.maximumEncodedLength else {
+                throw OppoProtobufError.messageTooLarge
+            }
+            result.append(contentsOf: prefix)
+            result.append(contentsOf: payload)
+        }
+        return Data(result)
+    }
+
+    private static func varint(_ value: UInt64) -> [UInt8] {
+        var remaining = value
+        var result: [UInt8] = []
+        repeat {
+            var byte = UInt8(remaining & 0x7f)
+            remaining >>= 7
+            if remaining != 0 { byte |= 0x80 }
+            result.append(byte)
+        } while remaining != 0
+        return result
+    }
+}
+
+/// Live protocol data only: deliberately not Codable and never included in a
+/// diagnostic report. `streamOffset` is the first frame header's byte offset,
+/// even if the final fragment arrives after a later authentication submission.
+struct OppoWireMessage: Equatable {
+    let serviceID: UInt8
+    let commandID: UInt8
+    let protobuf: Data
+    let streamOffset: Int
+    let controlFlags: UInt16
+    let frameCount: Int
+    let frameShape: String
+    let crcValidation: String
 }
 
 /// Reported peer values, never negotiated limits and never proof of binding.
@@ -113,6 +362,7 @@ enum OppoDecodeError: Error, Equatable {
 
 enum OppoDecodeEvent: Equatable {
     case capabilities(OppoTransportCapabilities)
+    case message(OppoWireMessage)
     case rejected(OppoDecodeError)
 }
 
@@ -168,6 +418,7 @@ struct OppoTransportDecoder {
     static let maximumReceivedByteCount = 64 * 1024
     static let maximumRecentFrames = 32
 
+    private let emitAuthenticationMessages: Bool
     private var buffer: [UInt8] = []
     private var bufferStartOffset = 0
     private var queryBoundaryOffset: Int?
@@ -180,6 +431,10 @@ struct OppoTransportDecoder {
     private(set) var diagnostics = OppoDecoderDiagnostics()
 
     var hasPendingData: Bool { !buffer.isEmpty || fragmentPayload != nil }
+
+    init(emitAuthenticationMessages: Bool = false) {
+        self.emitAuthenticationMessages = emitAuthenticationMessages
+    }
 
     mutating func reset() {
         buffer.removeAll(keepingCapacity: false)
@@ -303,6 +558,22 @@ struct OppoTransportDecoder {
                 diagnostics.preQueryMessageCount += 1
             } else {
                 diagnostics.postQueryMessageCount += 1
+            }
+            if emitAuthenticationMessages, completed.payload.count >= 2,
+               completed.payload[0] == 1,
+               [UInt8(24), 25, 36, 37].contains(completed.payload[1] & 0x7f) {
+                // Framing validity is not schema validity or authentication.
+                // Include prequery messages with their original stream offset;
+                // the engine checks its actual submission boundary per stage.
+                let message = OppoWireMessage(
+                    serviceID: completed.payload[0], commandID: completed.payload[1],
+                    protobuf: Data(completed.payload.dropFirst(2)), streamOffset: completed.startOffset,
+                    controlFlags: completed.control, frameCount: completed.frames,
+                    frameShape: completed.frames == 1 ? "SINGLE_FRAME" : "REASSEMBLED_FRAGMENTS",
+                    crcValidation: completed.crcValidation)
+                recordFrame(packet, messageStart: completed.startOffset, payload: completed.payload,
+                            disposition: "AUTHENTICATION_MESSAGE_FOR_STATE_MACHINE")
+                return .message(message)
             }
             do {
                 let capabilities = try decodeCapabilities(completed.payload, control: completed.control,
@@ -508,9 +779,9 @@ struct OppoTransportDecoder {
             throw OppoDecodeError.missingRequiredFields
         }
         guard (1...5).contains(version) else { throw OppoDecodeError.unsupportedProtocolVersion(version) }
-        // These are reporting bounds, not negotiated BLE limits. In particular,
-        // do not reject a peer's 990-byte transport MTU just because CoreBluetooth
-        // permits a smaller individual ATT write. No returned value is applied.
+        // Preserve the peer's actual advertised bounds. A 990-byte transport
+        // MTU is valid even when CoreBluetooth permits smaller ATT writes; the
+        // sender separately applies its conservative frame and ATT limits.
         guard (8...65_535).contains(frameSize) else {
             throw OppoDecodeError.invalidCapabilityValue(field: 2, value: frameSize)
         }

@@ -56,7 +56,7 @@ final class ModelsTests: XCTestCase {
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let capabilities = try XCTUnwrap(object["capabilities"] as? [String: Any])
         XCTAssertEqual(capabilities["classicRFCOMM"] as? String, WatchProfile.classicUnavailable)
-        XCTAssertEqual(capabilities["vendorAuthentication"] as? String, WatchProfile.notImplemented)
+        XCTAssertEqual(capabilities["vendorAuthentication"] as? String, "EXPERIMENTAL_PROTOCOL_3_TO_5")
         XCTAssertEqual(capabilities["healthSync"] as? String, WatchProfile.notImplemented)
         let observation = try XCTUnwrap(object["observations"] as? [String: Any])
         XCTAssertEqual(observation["gattConnectedAtExport"] as? Bool, true)
