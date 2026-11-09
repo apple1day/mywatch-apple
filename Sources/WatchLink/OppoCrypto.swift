@@ -147,23 +147,44 @@ final class OppoRSAKeyPair {
     }
 }
 
-/// AES-256 proof-envelope decoder for ConsultProto.AESConsult. The caller must
-/// compare the entire returned plaintext with the independently supplied proof.
+/// AES-256 envelopes used by AESConsult and subsequent encrypted business
+/// messages. AESConsult callers must compare the entire decrypted proof with
+/// its independently supplied plaintext. CTR alone is not an integrity check.
 enum OppoSessionCrypto {
+    static func encryptEnvelope(plaintext: Data, key32: Data, iv16: Data) throws -> Data {
+        guard key32.count == 32 else { throw OppoCryptoError.invalidSessionKeyLength }
+        guard iv16.count == 16 else { throw OppoCryptoError.invalidIVLength }
+        guard !plaintext.isEmpty else { throw OppoCryptoError.emptyPlaintext }
+        guard plaintext.count <= OppoCryptoEnvelope.maximumPaddedBytes else {
+            throw OppoCryptoError.inputTooLarge
+        }
+        // AESCipher.e(): prefix zero for an aligned message, otherwise pad
+        // with zeros and put the padding count before the ciphertext.
+        let padding = (16 - plaintext.count % 16) % 16
+        var padded = Data(plaintext)
+        padded.append(Data(repeating: 0, count: padding))
+        let ciphertext = try applyCTR(padded, key32: key32, iv16: iv16)
+        return Data([UInt8(padding)]) + ciphertext
+    }
+
     static func decryptEnvelope(envelope: Data, key32: Data, iv16: Data) throws -> Data {
         guard key32.count == 32 else { throw OppoCryptoError.invalidSessionKeyLength }
         guard iv16.count == 16 else { throw OppoCryptoError.invalidIVLength }
         // AESCipher.d() explicitly treats prefix 16 as zero; e() emits zero.
         let parsed = try OppoCryptoEnvelope.parse(envelope, acceptsAlignedPrefix16: true)
+        let padded = try applyCTR(parsed.ciphertext, key32: key32, iv16: iv16)
+        return try OppoCryptoEnvelope.removePadding(padded, count: parsed.padding)
+    }
 
+    private static func applyCTR(_ input: Data, key32: Data, iv16: Data) throws -> Data {
         // libencrypt.so AES_CTR_xcrypt_buffer (0x1e70): encrypt the supplied IV
         // first, then increment bytes 15...0, carrying through all 128 bits.
         // Its JNI wrapper reinitializes the IV for each envelope. Generate the
         // exact counter blocks here and use the system AES primitive so no
         // CommonCrypto mode-specific counter width or endian default is assumed.
         var counter = Array(iv16)
-        var counters = Data(capacity: parsed.ciphertext.count)
-        for _ in stride(from: 0, to: parsed.ciphertext.count, by: 16) {
+        var counters = Data(capacity: input.count)
+        for _ in stride(from: 0, to: input.count, by: 16) {
             counters.append(contentsOf: counter)
             for index in stride(from: 15, through: 0, by: -1) {
                 counter[index] &+= 1
@@ -171,8 +192,7 @@ enum OppoSessionCrypto {
             }
         }
         let keystream = try OppoAESPrimitive.ecb(counters, key: key32, operation: CCOperation(kCCEncrypt))
-        let padded = Data(zip(parsed.ciphertext, keystream).map { $0.0 ^ $0.1 })
-        return try OppoCryptoEnvelope.removePadding(padded, count: parsed.padding)
+        return Data(zip(input, keystream).map { $0.0 ^ $0.1 })
     }
 }
 

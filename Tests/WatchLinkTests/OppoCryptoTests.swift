@@ -121,6 +121,8 @@ final class OppoCryptoTests: XCTestCase {
             + "f69f2445df4f9b17ad2b417be66c3710")
         XCTAssertEqual(try OppoSessionCrypto.decryptEnvelope(envelope: envelope, key32: key, iv16: iv), expected)
         XCTAssertEqual(try OppoSessionCrypto.decryptEnvelope(envelope: envelope, key32: key, iv16: iv), expected)
+        XCTAssertEqual(try OppoSessionCrypto.encryptEnvelope(plaintext: expected, key32: key, iv16: iv), envelope)
+        XCTAssertEqual(try OppoSessionCrypto.encryptEnvelope(plaintext: expected, key32: key, iv16: iv), envelope)
     }
 
     func testAES256CTRFull128BitBigEndianCarry() throws {
@@ -137,6 +139,45 @@ final class OppoCryptoTests: XCTestCase {
         for (ivHex, envelopeHex) in vectors {
             XCTAssertEqual(try OppoSessionCrypto.decryptEnvelope(envelope: hex(envelopeHex), key32: key,
                                                                  iv16: hex(ivHex)), expected)
+            XCTAssertEqual(try OppoSessionCrypto.encryptEnvelope(plaintext: expected, key32: key,
+                                                                 iv16: hex(ivHex)), hex(envelopeHex))
+        }
+    }
+
+    func testAES256CTREncryptionMatchesIndependentPaddingBoundaryFixtures() throws {
+        let key = Data((0..<32).map(UInt8.init))
+        let iv = hex("000102030405060708090a0b0c0d0e0f")
+        // Independent Python cryptography AES/CTR fixtures. Exact alignment
+        // must use prefix0 and must not add another padded block.
+        let vectors: [(Int, String)] = [
+            (2, "0e5a6f045708fb7196f02e553d02c3a692"),
+            (15, "015a6f06540cfe7791f8275f360ecea892"),
+            (16, "005a6f06540cfe7791f8275f360ecea89d"),
+            (17, "0f5a6f06540cfe7791f8275f360ecea89d70f310d5c385585d5516fb5172e520cf"),
+            (31, "015a6f06540cfe7791f8275f360ecea89d70e202c6d7904e4a4d0fe14a6ef83ecf"),
+            (32, "005a6f06540cfe7791f8275f360ecea89d70e202c6d7904e4a4d0fe14a6ef83ed0")
+        ]
+        for (length, expected) in vectors {
+            let plaintext = Data((0..<length).map(UInt8.init))
+            XCTAssertEqual(try OppoSessionCrypto.encryptEnvelope(plaintext: plaintext, key32: key, iv16: iv),
+                           hex(expected))
+        }
+    }
+
+    func testAES256CTREncryptionRejectsInvalidInputsBeforeAllocation() {
+        let key = Data(repeating: 0, count: 32)
+        let iv = Data(repeating: 0, count: 16)
+        assertCryptoError(.invalidSessionKeyLength) {
+            _ = try OppoSessionCrypto.encryptEnvelope(plaintext: Data([1]), key32: Data(count: 16), iv16: iv)
+        }
+        assertCryptoError(.invalidIVLength) {
+            _ = try OppoSessionCrypto.encryptEnvelope(plaintext: Data([1]), key32: key, iv16: Data(count: 15))
+        }
+        assertCryptoError(.emptyPlaintext) {
+            _ = try OppoSessionCrypto.encryptEnvelope(plaintext: Data(), key32: key, iv16: iv)
+        }
+        assertCryptoError(.inputTooLarge) {
+            _ = try OppoSessionCrypto.encryptEnvelope(plaintext: Data(count: 65_537), key32: key, iv16: iv)
         }
     }
 

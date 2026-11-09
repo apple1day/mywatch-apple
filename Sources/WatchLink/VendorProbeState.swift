@@ -99,6 +99,8 @@ struct VendorCommandWriteSnapshot: Codable, Equatable {
     var firstSubmittedAt: Date?
     var lastCallbackAt: Date?
     var error: VendorGATTTransport.Failure?
+    var serviceID = 1
+    var encrypted = false
 
     var fullyAcknowledged: Bool {
         frameCount > 0 && acknowledgedFragments == frameCount && error == nil
@@ -125,7 +127,7 @@ struct VendorCommandWriteSnapshot: Codable, Equatable {
 /// GATT, capability observations, transport authentication and account binding
 /// remain distinct even after a successful identity challenge.
 struct VendorProbeSnapshot: Codable, Equatable {
-    var mode = "TRANSPORT_AND_IDENTITY_VERIFICATION"
+    var mode = "TRANSPORT_IDENTITY_AND_INITIAL_SETUP"
     var profileAvailable = false
     var profileDiscoveryCompleted = false
     var status = "NOT_ATTEMPTED"
@@ -156,6 +158,10 @@ struct VendorProbeSnapshot: Codable, Equatable {
     var decoderDiagnostics = OppoDecoderDiagnostics()
     var error: VendorGATTTransport.Failure?
     var authentication = VendorAuthenticationSnapshot()
+    var initialSetup = OppoSetupSnapshot()
+    var businessSessionState = "NOT_ESTABLISHED"
+    var businessEncrypted: Bool?
+    var ignoredBusinessMessageCount = 0
     var commandWrites: [VendorCommandWriteSnapshot] = []
 
     /// Records only the initial capability query, once per connection. The
@@ -198,6 +204,11 @@ struct VendorProbeSnapshot: Codable, Equatable {
         case "CAPABILITIES_WAITING_FOR_WRITE": return "已取得协议能力 · 等待查询写入确认"
         case "AUTHENTICATING": return authentication.phaseDescription
         case "AUTHENTICATED_BINDING_PENDING": return "传输身份认证通过 · 业务绑定尚未实现"
+        case "READY_FOR_INITIAL_SETUP": return "身份验证已通过 · 可以继续首次设置"
+        case "INITIAL_SETUP_RUNNING", "INITIAL_SETUP_OBSERVED", "INITIAL_SETUP_FAILED", "INITIAL_SETUP_INTERRUPTED":
+            return initialSetup.summary
+        case "BUSINESS_SESSION_FAILED": return "身份已通过，但业务通道已结束 · 请重连后继续"
+        case "BUSINESS_SESSION_CLOSED": return "身份验证结果已保留 · 继续设置前请重连"
         case "FAILED": return "连接验证未完成 · 查看下方失败原因"
         case "INTERRUPTED": return "连接验证已中断 · 本次结果已保留"
         default:
@@ -213,6 +224,7 @@ struct VendorProbeSnapshot: Codable, Equatable {
         case "CAPABILITIES_WAITING_FOR_WRITE": return "正在等待写入确认…"
         case "AUTHENTICATING": return authentication.phaseDescription + "…"
         case "AUTHENTICATED_BINDING_PENDING": return "身份验证已通过"
+        case "READY_FOR_INITIAL_SETUP", "INITIAL_SETUP_RUNNING", "INITIAL_SETUP_OBSERVED", "INITIAL_SETUP_FAILED", "INITIAL_SETUP_INTERRUPTED", "BUSINESS_SESSION_FAILED", "BUSINESS_SESSION_CLOSED": return "身份验证已通过"
         case "FAILED": return "本次验证失败"
         case "INTERRUPTED": return "本次验证已中断"
         default: return "验证连接与身份"

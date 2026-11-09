@@ -1,7 +1,7 @@
 import Foundation
 
-/// Clear transport framing reconstructed from ps0.g and dt0.a in the supplied
-/// APK. Authentication payloads are interpreted by the separate state machine;
+/// Transport framing reconstructed from ps0.g and dt0.a in the supplied APK.
+/// Authentication and business payloads are interpreted by separate state machines;
 /// this layer never treats receipt of a frame as authentication or binding.
 enum OppoProtocol {
     /// sid=1, cid=1; protobuf version=5, frame=20, MTU=20, interval=10,
@@ -17,8 +17,9 @@ enum OppoProtocol {
 
     /// `maximumFrameLength` bounds the whole TL frame, including SOF, length,
     /// control, optional FSN and CRC. The APK starts each message's FSN at zero.
-    /// Timing and ATT limits belong to the caller, not the wire codec. Only
-    /// clear outer framing is emitted; cipher text may be a protobuf bytes field.
+    /// Timing and ATT limits belong to the caller, not the wire codec. Identity
+    /// consultation uses clear outer framing even when protobuf fields contain
+    /// their own encrypted proofs.
     static func encode(service: UInt8, command: UInt8, protobuf: Data,
                        maximumFrameLength: Int, startingSequence: UInt8 = 0) throws -> [Data] {
         guard (8...(OppoTransportDecoder.maximumFrameBodyLength + 5)).contains(maximumFrameLength) else {
@@ -27,24 +28,42 @@ enum OppoProtocol {
         guard protobuf.count <= OppoProtobufReader.maximumEncodedLength else {
             throw OppoWireError.messageTooLarge
         }
-        let payload = [service, command] + Array(protobuf)
+        return try encodePayload(Data([service, command]) + protobuf, encrypted: false,
+                                 maximumFrameLength: maximumFrameLength, startingSequence: startingSequence)
+    }
+
+    /// Business sessions seal the complete SID/CID/protobuf payload before
+    /// handing it to this codec. Encryption is a whole-message property and
+    /// its control bit is repeated on every physical fragment (ps0.g.j()).
+    /// No secret, encrypted bytes or arbitrary protobuf values enter reports.
+    static func encodePayload(_ payload: Data, encrypted: Bool,
+                              maximumFrameLength: Int, startingSequence: UInt8 = 0) throws -> [Data] {
+        guard (8...(OppoTransportDecoder.maximumFrameBodyLength + 5)).contains(maximumFrameLength) else {
+            throw OppoWireError.invalidFrameLimit
+        }
+        guard payload.count >= 2 else { throw OppoWireError.invalidPayloadLength }
+        guard payload.count <= OppoTransportDecoder.maximumMessageLength else {
+            throw OppoWireError.messageTooLarge
+        }
+        let bytes = Array(payload)
+        let encryptionControl: UInt8 = encrypted ? 0x40 : 0
         let singleCapacity = payloadCapacity(frameLimit: maximumFrameLength, controlLength: 2)
-        if payload.count <= singleCapacity {
-            return [frame(payload: payload[...], control: 0, sequence: nil)]
+        if bytes.count <= singleCapacity {
+            return [frame(payload: bytes[...], control: encryptionControl, sequence: nil)]
         }
 
         let fragmentCapacity = payloadCapacity(frameLimit: maximumFrameLength, controlLength: 3)
-        let frameCount = (payload.count + fragmentCapacity - 1) / fragmentCapacity
+        let frameCount = (bytes.count + fragmentCapacity - 1) / fragmentCapacity
         guard frameCount <= OppoTransportDecoder.maximumFragmentCount else {
             throw OppoWireError.tooManyFragments
         }
         var frames: [Data] = []
         for index in 0..<frameCount {
             let start = index * fragmentCapacity
-            let end = min(start + fragmentCapacity, payload.count)
+            let end = min(start + fragmentCapacity, bytes.count)
             let control: UInt8 = index == 0 ? 1 : (index == frameCount - 1 ? 3 : 2)
             let sequence = startingSequence &+ UInt8(truncatingIfNeeded: index)
-            frames.append(frame(payload: payload[start..<end], control: control, sequence: sequence))
+            frames.append(frame(payload: bytes[start..<end], control: control | encryptionControl, sequence: sequence))
         }
         return frames
     }
@@ -90,6 +109,7 @@ enum OppoProtocol {
 
 enum OppoWireError: String, Error, Equatable {
     case invalidFrameLimit = "INVALID_FRAME_LIMIT"
+    case invalidPayloadLength = "INVALID_PAYLOAD_LENGTH"
     case messageTooLarge = "MESSAGE_TOO_LARGE"
     case tooManyFragments = "TOO_MANY_FRAGMENTS"
 }
@@ -277,6 +297,18 @@ struct OppoWireMessage: Equatable {
     let crcValidation: String
 }
 
+/// A complete CRC-validated encrypted wire payload. Deliberately not Codable:
+/// only the active business session may decrypt and interpret its SID/CID.
+/// Header diagnostics never infer routing from encrypted bytes.
+struct OppoEncryptedMessage: Equatable {
+    let payload: Data
+    let streamOffset: Int
+    let controlFlags: UInt16
+    let frameCount: Int
+    let frameShape: String
+    let crcValidation: String
+}
+
 /// Reported peer values, never negotiated limits and never proof of binding.
 struct OppoTransportCapabilities: Codable, Equatable {
     let protocolVersion: Int
@@ -308,6 +340,7 @@ enum OppoDecodeError: Error, Equatable {
     case unsupportedControl
     case unexpectedFragment
     case fragmentSequenceMismatch
+    case fragmentEncryptionMismatch
     case interleavedMessage
     case unexpectedCommand(service: UInt8, command: UInt8)
     case malformedProtobuf
@@ -331,6 +364,7 @@ enum OppoDecodeError: Error, Equatable {
         case .unsupportedControl: return "UNSUPPORTED_CONTROL_FLAGS"
         case .unexpectedFragment: return "UNEXPECTED_FRAGMENT"
         case .fragmentSequenceMismatch: return "FRAGMENT_SEQUENCE_MISMATCH"
+        case .fragmentEncryptionMismatch: return "FRAGMENT_ENCRYPTION_MISMATCH"
         case .interleavedMessage: return "INTERLEAVED_MESSAGE"
         case .unexpectedCommand: return "UNEXPECTED_SERVICE_OR_COMMAND"
         case .malformedProtobuf: return "MALFORMED_PROTOBUF"
@@ -363,6 +397,7 @@ enum OppoDecodeError: Error, Equatable {
 enum OppoDecodeEvent: Equatable {
     case capabilities(OppoTransportCapabilities)
     case message(OppoWireMessage)
+    case encryptedMessage(OppoEncryptedMessage)
     case rejected(OppoDecodeError)
 }
 
@@ -419,6 +454,7 @@ struct OppoTransportDecoder {
     static let maximumRecentFrames = 32
 
     private let emitAuthenticationMessages: Bool
+    private let emitBusinessMessages: Bool
     private var buffer: [UInt8] = []
     private var bufferStartOffset = 0
     private var queryBoundaryOffset: Int?
@@ -426,14 +462,16 @@ struct OppoTransportDecoder {
     private var fragmentStartOffset: Int?
     private var lastFragmentSequence: UInt8?
     private var fragmentCount = 0
+    private var fragmentEncrypted: Bool?
     private var fragmentCRCOrders: Set<CRCByteOrder> = []
     private var failed = false
     private(set) var diagnostics = OppoDecoderDiagnostics()
 
     var hasPendingData: Bool { !buffer.isEmpty || fragmentPayload != nil }
 
-    init(emitAuthenticationMessages: Bool = false) {
+    init(emitAuthenticationMessages: Bool = false, emitBusinessMessages: Bool = false) {
         self.emitAuthenticationMessages = emitAuthenticationMessages
+        self.emitBusinessMessages = emitBusinessMessages
     }
 
     mutating func reset() {
@@ -497,6 +535,7 @@ struct OppoTransportDecoder {
         fragmentStartOffset = nil
         lastFragmentSequence = nil
         fragmentCount = 0
+        fragmentEncrypted = nil
         fragmentCRCOrders.removeAll()
     }
 
@@ -528,8 +567,11 @@ struct OppoTransportDecoder {
     private mutating func process(_ packet: Packet) -> OppoDecodeEvent? {
         let fragmentType = packet.control & 3
         let messageStart = fragmentType <= 1 ? packet.startOffset : fragmentStartOffset
-        if packet.control & 0x0040 != 0 {
+        let encrypted = packet.control & 0x0040 != 0
+        if encrypted {
             diagnostics.encryptedFrameCount += 1
+        }
+        if encrypted, !emitBusinessMessages {
             recordIssue(.encryptedFrame)
             recordFrame(packet, messageStart: messageStart, payload: nil, disposition: "IGNORED_ENCRYPTED_FRAME")
             // Like other single frames, this notification is independent of
@@ -540,7 +582,8 @@ struct OppoTransportDecoder {
         }
         // Bit 3 is emitted by the APK and does not alter its parsing. Its
         // semantics are not labelled ACK. Other unknown controls are not used.
-        guard packet.control & ~UInt16(0x000b) == 0 else {
+        let supportedControl: UInt16 = emitBusinessMessages ? 0x004b : 0x000b
+        guard packet.control & ~supportedControl == 0 else {
             recordIssue(.unsupportedControl)
             recordFrame(packet, messageStart: messageStart, payload: nil, disposition: "IGNORED_UNSUPPORTED_CONTROL")
             if fragmentType != 0 { clearFragments() }
@@ -549,9 +592,10 @@ struct OppoTransportDecoder {
 
         do {
             guard let completed = try assemble(packet) else {
-                let initialPayload = fragmentType == 1 ? Array(packet.payload.dropFirst()) : nil
+                let initialPayload = fragmentType == 1 && !encrypted ? Array(packet.payload.dropFirst()) : nil
+                let disposition = fragmentType == 1 ? "FRAGMENT_START" : "FRAGMENT_CONTINUATION"
                 recordFrame(packet, messageStart: messageStart, payload: initialPayload,
-                            disposition: fragmentType == 1 ? "FRAGMENT_START" : "FRAGMENT_CONTINUATION")
+                            disposition: encrypted ? "ENCRYPTED_" + disposition : disposition)
                 return nil
             }
             if origin(of: completed.startOffset) == "PRE_QUERY" {
@@ -559,9 +603,23 @@ struct OppoTransportDecoder {
             } else {
                 diagnostics.postQueryMessageCount += 1
             }
-            if emitAuthenticationMessages, completed.payload.count >= 2,
-               completed.payload[0] == 1,
-               [UInt8(24), 25, 36, 37].contains(completed.payload[1] & 0x7f) {
+            if encrypted {
+                let message = OppoEncryptedMessage(
+                    payload: Data(completed.payload), streamOffset: completed.startOffset,
+                    controlFlags: completed.control, frameCount: completed.frames,
+                    frameShape: completed.frames == 1 ? "SINGLE_FRAME" : "REASSEMBLED_FRAGMENTS",
+                    crcValidation: completed.crcValidation)
+                recordFrame(packet, messageStart: completed.startOffset, payload: nil,
+                            disposition: "ENCRYPTED_MESSAGE_FOR_BUSINESS_SESSION")
+                return .encryptedMessage(message)
+            }
+            let authenticationMessage = emitAuthenticationMessages && completed.payload.count >= 2
+                && completed.payload[0] == 1
+                && [UInt8(24), 25, 36, 37].contains(completed.payload[1] & 0x7f)
+            let businessMessage = emitBusinessMessages && completed.payload.count >= 2
+                && completed.payload[0] == 11
+                && [UInt8(7), 11, 12].contains(completed.payload[1] & 0x7f)
+            if authenticationMessage || businessMessage {
                 // Framing validity is not schema validity or authentication.
                 // Include prequery messages with their original stream offset;
                 // the engine checks its actual submission boundary per stage.
@@ -572,7 +630,8 @@ struct OppoTransportDecoder {
                     frameShape: completed.frames == 1 ? "SINGLE_FRAME" : "REASSEMBLED_FRAGMENTS",
                     crcValidation: completed.crcValidation)
                 recordFrame(packet, messageStart: completed.startOffset, payload: completed.payload,
-                            disposition: "AUTHENTICATION_MESSAGE_FOR_STATE_MACHINE")
+                            disposition: authenticationMessage ? "AUTHENTICATION_MESSAGE_FOR_STATE_MACHINE"
+                                : "BUSINESS_MESSAGE_FOR_STATE_MACHINE")
                 return .message(message)
             }
             do {
@@ -729,13 +788,17 @@ struct OppoTransportDecoder {
             fragmentStartOffset = packet.startOffset
             lastFragmentSequence = sequence
             fragmentCount = 1
+            fragmentEncrypted = packet.control & 0x0040 != 0
             fragmentCRCOrders = Set(packet.crcOrder.map { [$0] } ?? [])
             return nil
         }
 
         guard var assembled = fragmentPayload, let previous = lastFragmentSequence,
-              let startOffset = fragmentStartOffset else {
+              let startOffset = fragmentStartOffset, let encrypted = fragmentEncrypted else {
             throw OppoDecodeError.unexpectedFragment
+        }
+        guard encrypted == (packet.control & 0x0040 != 0) else {
+            throw OppoDecodeError.fragmentEncryptionMismatch
         }
         guard sequence == previous &+ 1 else { throw OppoDecodeError.fragmentSequenceMismatch }
         guard fragmentCount < Self.maximumFragmentCount,

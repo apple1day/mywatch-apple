@@ -144,16 +144,18 @@ struct CapabilitySnapshot: Codable, Equatable {
     let classicRFCOMM: String
     let vendorAuthentication: String
     let accountBinding: String
+    let initialSetup: String
     let healthSync: String
     let notifications: String
     let commandRFCOMMUUID: String
     let dataRFCOMMUUID: String
 
     init() {
-        gatt = "CORE_BLUETOOTH_DIAGNOSTICS_AND_IDENTITY_VERIFICATION"
+        gatt = "CORE_BLUETOOTH_IDENTITY_AND_INITIAL_SETUP"
         classicRFCOMM = WatchProfile.classicUnavailable
         vendorAuthentication = "EXPERIMENTAL_PROTOCOL_3_TO_5"
         accountBinding = WatchProfile.notImplemented
+        initialSetup = "EXPERIMENTAL_START_AND_STATE_OBSERVATION"
         healthSync = WatchProfile.notImplemented
         notifications = WatchProfile.notImplemented
         commandRFCOMMUUID = WatchProfile.commandRFCOMM

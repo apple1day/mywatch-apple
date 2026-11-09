@@ -355,6 +355,112 @@ final class OppoAuthenticationTests: XCTestCase {
         XCTAssertTrue(engine.identityVerified)
     }
 
+    func testClearBusinessSessionTransfersOnceAfterIdentityAndWholeWrite() throws {
+        let engine = makeEngine()
+        XCTAssertNil(engine.takeBusinessSession())
+        let request = try reachIdentity(engine, support: 0)
+        XCTAssertNil(engine.takeBusinessSession())
+        _ = engine.didSubmit(token: request.token, streamOffset: 200)
+        _ = engine.receive(try identityMessage(offset: 200))
+        XCTAssertNil(engine.takeBusinessSession())
+        _ = try completed(engine.writeCompleted(token: request.token, succeeded: true))
+        let session = try XCTUnwrap(engine.takeBusinessSession())
+        XCTAssertFalse(session.isEncrypted)
+        XCTAssertNil(engine.takeBusinessSession())
+        let payload = Data([11, 7, 8, 1, 16, 2])
+        XCTAssertEqual(try session.sealPayload(payload), payload)
+        // After transfer, retiring the handshake must not destroy the owner's
+        // business session. Connection teardown invalidates it separately.
+        engine.cancel()
+        XCTAssertEqual(try session.openPayload(payload, encrypted: false), payload)
+        session.invalidate()
+        XCTAssertThrowsError(try session.sealPayload(payload))
+    }
+
+    func testEncryptedBusinessSessionTransfersOnlyAfterFinalAcknowledgement() throws {
+        let engine = makeEngine()
+        let rsa = try reachRSA(engine)
+        XCTAssertNil(engine.takeBusinessSession())
+        _ = engine.didSubmit(token: rsa.token, streamOffset: 300)
+        _ = engine.receive(try sessionMessage(offset: 300))
+        XCTAssertNil(engine.takeBusinessSession())
+        let confirmation = try sent(engine.writeCompleted(token: rsa.token, succeeded: true))
+        XCTAssertTrue(engine.keyExchangeVerified)
+        XCTAssertNil(engine.takeBusinessSession())
+        _ = engine.didSubmit(token: confirmation.token, streamOffset: 400)
+        XCTAssertNil(engine.takeBusinessSession())
+        _ = try completed(engine.writeCompleted(token: confirmation.token, succeeded: true))
+        let session = try XCTUnwrap(engine.takeBusinessSession())
+        XCTAssertTrue(session.isEncrypted)
+        XCTAssertNil(engine.takeBusinessSession())
+        // Independent AES/CTR fixtures for fakeDependencies' synthetic key/IV.
+        XCTAssertEqual(try session.sealPayload(Data([11, 11])),
+                       hex("0e973aa86bb952d1d7efeac0e3e790ddd9"))
+        XCTAssertEqual(try session.openPayload(hex("0c973aa06bb952d1d7efeac0e3e790ddd9"), encrypted: true),
+                       Data([11, 11, 8, 0]))
+        XCTAssertThrowsError(try session.openPayload(Data([11, 11, 8, 0]), encrypted: false))
+    }
+
+    func testFailedTimedOutOrCancelledFinalWriteCannotExposeBusinessSession() throws {
+        for terminal in 0..<3 {
+            let engine = makeEngine()
+            let confirmation = try reachConfirmation(engine)
+            XCTAssertTrue(engine.keyExchangeVerified)
+            XCTAssertNil(engine.takeBusinessSession())
+            _ = engine.didSubmit(token: confirmation.token, streamOffset: 400)
+            switch terminal {
+            case 0: _ = try failed(engine.writeCompleted(token: confirmation.token, succeeded: false))
+            case 1: _ = try failed(engine.timeout())
+            default: engine.cancel()
+            }
+            XCTAssertNil(engine.takeBusinessSession())
+            XCTAssertTrue(engine.writeCompleted(token: confirmation.token, succeeded: true).isEmpty)
+            XCTAssertNil(engine.takeBusinessSession())
+        }
+    }
+
+    func testCancellingCompletedUntakenSessionPreventsLaterTransfer() throws {
+        for encrypted in [false, true] {
+            let engine = makeEngine()
+            if encrypted {
+                let confirmation = try reachConfirmation(engine)
+                _ = engine.didSubmit(token: confirmation.token, streamOffset: 400)
+                _ = try completed(engine.writeCompleted(token: confirmation.token, succeeded: true))
+            } else {
+                let identity = try reachIdentity(engine, support: 0)
+                _ = engine.didSubmit(token: identity.token, streamOffset: 200)
+                _ = engine.writeCompleted(token: identity.token, succeeded: true)
+                _ = try completed(engine.receive(try identityMessage(offset: 200)))
+            }
+            engine.cancel()
+            XCTAssertNil(engine.takeBusinessSession())
+            XCTAssertEqual(engine.phase, .cancelled)
+        }
+    }
+
+    func testTransferredSessionOutlivesRetiredAuthenticationEngine() throws {
+        var engine: OppoAuthentication? = makeEngine()
+        weak var witness = engine
+        let confirmation = try reachConfirmation(try XCTUnwrap(engine))
+        _ = engine?.didSubmit(token: confirmation.token, streamOffset: 400)
+        _ = try completed(try XCTUnwrap(engine).writeCompleted(token: confirmation.token, succeeded: true))
+        let session = try XCTUnwrap(engine?.takeBusinessSession())
+        engine = nil
+        XCTAssertNil(witness)
+        XCTAssertEqual(try session.sealPayload(Data([11, 11])),
+                       hex("0e973aa86bb952d1d7efeac0e3e790ddd9"))
+        session.invalidate()
+        XCTAssertThrowsError(try session.sealPayload(Data([11, 11])))
+    }
+
+    private func hex(_ value: String) -> Data {
+        let characters = Array(value)
+        precondition(characters.count % 2 == 0)
+        return Data(stride(from: 0, to: characters.count, by: 2).map {
+            UInt8(String(characters[$0...($0 + 1)]), radix: 16)!
+        })
+    }
+
     private func makeEngine() -> OppoAuthentication {
         OppoAuthentication(dependencies: fakeDependencies())
     }

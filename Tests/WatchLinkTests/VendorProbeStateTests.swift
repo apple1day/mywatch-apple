@@ -143,19 +143,42 @@ final class VendorCommandAndCapabilityTests: XCTestCase {
 
     func testAuthenticationFactsDoNotUpgradeBusinessBindingOrExposeProofs() throws {
         var snapshot = VendorProbeSnapshot()
-        snapshot.status = "AUTHENTICATED_BINDING_PENDING"
+        snapshot.status = "INITIAL_SETUP_OBSERVED"
         snapshot.vendorAuthentication = "PASSED"
         snapshot.authentication.phase = .completed
         snapshot.authentication.status = "PASSED"
         snapshot.authentication.identityVerified = true
         snapshot.authentication.keyExchangeVerified = true
         snapshot.authentication.transportAuthenticated = true
+        snapshot.businessSessionState = "ENDED"
+        snapshot.businessEncrypted = true
+        let setup = OppoSetup()
+        guard case .send(let start)? = setup.start().first else { return XCTFail("Missing start request") }
+        _ = setup.didSubmit(token: start.token, streamOffset: 0)
+        guard case .send(let query)? = setup.writeCompleted(token: start.token, succeeded: true).first else {
+            return XCTFail("Missing state query")
+        }
+        _ = setup.didSubmit(token: query.token, streamOffset: 0)
+        _ = setup.writeCompleted(token: query.token, succeeded: true)
+        _ = setup.receive(OppoWireMessage(serviceID: 11, commandID: 12, protobuf: Data([0x08, 0x3c]),
+                                         streamOffset: 0, controlFlags: 0x40, frameCount: 1,
+                                         frameShape: "SINGLE_FRAME", crcValidation: "CRC16_LE_VERIFIED"))
+        snapshot.initialSetup = setup.snapshot
+        var receipt = VendorCommandWriteSnapshot(commandID: 11, stage: "QUERY_OOBE_STATE", frameCount: 2,
+                                                queuedAt: Date(timeIntervalSince1970: 0))
+        receipt.serviceID = 11
+        receipt.encrypted = true
+        snapshot.commandWrites = [receipt]
         let encoded = try JSONEncoder().encode(snapshot)
         let restored = try JSONDecoder().decode(VendorProbeSnapshot.self, from: encoded)
         XCTAssertEqual(restored, snapshot)
         XCTAssertEqual(restored.accountBinding, "NOT_IMPLEMENTED")
+        XCTAssertEqual(restored.initialSetup.accountBinding, "NOT_IMPLEMENTED")
+        XCTAssertTrue(restored.initialSetup.deviceSetupFinishedReported)
+        XCTAssertEqual(restored.commandWrites.first?.serviceID, 11)
+        XCTAssertEqual(restored.commandWrites.first?.encrypted, true)
         let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
-        for privateField in ["clientNonce", "watchNonce", "protobuf", "identityKey", "privateKey", "encryptedProof"] {
+        for privateField in ["clientNonce", "watchNonce", "protobuf", "identityKey", "privateKey", "encryptedProof", "key32", "iv16"] {
             XCTAssertFalse(text.contains("\"" + privateField + "\""))
         }
     }

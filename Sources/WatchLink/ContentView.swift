@@ -88,7 +88,7 @@ struct ContentView: View {
                 Text("一代手表连接")
                     .font(.title.bold())
                     .accessibilityIdentifier("homeTitle")
-                Text("iPhone 连接验证版 · 0.3.0")
+                Text("iPhone 连接验证版 · 0.4.0")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Text("发现设备，记录真实的连接结果。")
@@ -103,14 +103,14 @@ struct ContentView: View {
         WatchCard {
             Label("先了解 iOS 的连接范围", systemImage: "info.circle.fill")
                 .font(.headline)
-            Text("本版会先查询手表协议能力，再尝试对应的传输身份认证与必要的加密协商。业务绑定和首次设置尚未实现，手表仍可能停在配对页面。")
+            Text("先验证手表身份，再点击“继续首次设置”，向手表发送设置请求并观察实际回应。账号登录、云绑定和健康同步尚未接入，是否能继续设置需要由手表验证。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("compatibilityNotice")
             HStack(spacing: 8) {
-                StatusTag(text: "传输身份验证", symbol: "wave.3.right", highlighted: true)
-                StatusTag(text: "业务绑定未适配", symbol: "lock")
+                StatusTag(text: "首次设置验证", symbol: "wave.3.right", highlighted: true)
+                StatusTag(text: "账号绑定未接入", symbol: "lock")
             }
         }
     }
@@ -121,7 +121,7 @@ struct ContentView: View {
                 Label("连接状态", systemImage: "antenna.radiowaves.left.and.right")
                     .font(.headline)
                 Spacer()
-                if monitor.isScanning || monitor.isConnecting || monitor.isCheckingVendorProtocol { ProgressView() }
+                if monitor.isScanning || monitor.isConnecting || monitor.isCheckingVendorProtocol || monitor.isSettingUp { ProgressView() }
             }
             Text(monitor.stateText)
                 .font(.body.weight(.medium))
@@ -192,7 +192,7 @@ struct ContentView: View {
                 .font(.title3.weight(.semibold))
                 .textSelection(.enabled)
             if monitor.isConnected {
-                Text("蓝牙通道已连接 · 业务绑定尚未实现")
+                Text("蓝牙通道已连接 · 账号绑定未接入")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
             }
@@ -212,7 +212,7 @@ struct ContentView: View {
                 .disabled(!monitor.canConnect)
                 .accessibilityIdentifier("connectButton")
             }
-            Text("选中设备仅表示操作对象已确定。连接后可读取标准信息，并继续验证传输身份。进入后台会释放连接；业务绑定、首次设置和健康同步尚未实现。")
+            Text("选中设备后，先连接并验证身份，再继续首次设置。请保持应用在前台；进入后台会释放连接，重试需重新连接和验证身份。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -228,12 +228,14 @@ struct ContentView: View {
                             complete: observedCapabilities != nil)
             verificationRow("传输身份", state: authenticationLabel,
                             complete: monitor.vendorProtocol.authentication.transportAuthenticated)
-            verificationRow("业务绑定与首次设置", state: "尚未实现", complete: false)
+            verificationRow("首次设置", state: initialSetupLabel,
+                            complete: monitor.vendorProtocol.initialSetup.deviceSetupFinishedReported)
+            verificationRow("账号绑定", state: "尚未接入", complete: false)
             Divider()
             Text(monitor.vendorProtocol.summary)
                 .font(.subheadline.weight(.medium))
                 .accessibilityIdentifier("vendorProtocolState")
-            Text("系统验证码由 iOS 处理。下面的验证会根据手表返回的协议继续交换身份信息；身份认证通过仍不等于业务绑定完成。")
+            Text("系统验证码由 iOS 处理。身份验证通过后，本次连接会保留，用于继续首次设置。手表设置状态和账号绑定分别记录。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             Button { monitor.checkVendorProtocol() } label: {
@@ -247,6 +249,7 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!monitor.canCheckVendorProtocol)
             .accessibilityIdentifier("checkVendorProtocolButton")
+            initialSetupActions
             if let capabilities = observedCapabilities {
                 Text("手表协议版本：\(capabilities.protocolVersion)")
                     .font(.subheadline)
@@ -268,15 +271,55 @@ struct ContentView: View {
                     .font(.footnote).foregroundStyle(.red)
                     .accessibilityIdentifier("verificationFailure")
             }
-            if !monitor.isCheckingVendorProtocol, monitor.vendorProtocol.status != "NOT_ATTEMPTED" {
+            if !monitor.isCheckingVendorProtocol, !monitor.isSettingUp,
+               monitor.vendorProtocol.status != "NOT_ATTEMPTED" {
                 Button("导出本次验证结果") {
                     reportSnapshot = ReportSnapshot(data: monitor.makeReport())
                 }
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier("exportVerificationReportButton")
-                Text("本次连接的验证已结束。重新验证前请先断开并重连。")
+                Text(monitor.canStartInitialSetup
+                     ? "身份验证已通过。请保持前台，点击“继续首次设置”。"
+                     : "本轮验证已结束。重新尝试前请先断开并重连。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var initialSetupActions: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button { monitor.startInitialSetup() } label: {
+                HStack {
+                    if monitor.isSettingUp { ProgressView() }
+                    Text(monitor.initialSetupButtonTitle)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!monitor.canStartInitialSetup)
+            .accessibilityIdentifier("startInitialSetupButton")
+            if monitor.vendorProtocol.initialSetup.status != "NOT_STARTED" {
+                Text(monitor.vendorProtocol.initialSetup.summary)
+                    .font(.footnote.weight(.medium))
+                    .accessibilityIdentifier("initialSetupState")
+            }
+            Text("继续后会发送开始设置请求，并查询手表状态；查询后的观察最多约 45 秒。请同时查看手表是否离开配对页面。写入确认只表示消息已送达蓝牙层。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var initialSetupLabel: String {
+        switch monitor.vendorProtocol.initialSetup.status {
+        case "START_SETTING": return "正在开始"
+        case "QUERY_OOBE_STATE", "OBSERVING_DEVICE_STATE": return "正在观察"
+        case "DEVICE_SETUP_FINISHED_REPORTED": return "设备报告完成"
+        case "DEVICE_SETUP_PENDING": return "仍待完成"
+        case "DEVICE_STATE_UNRECOGNIZED": return "状态待分析"
+        case "FAILED": return "本轮未完成"
+        case "INTERRUPTED": return "已中断"
+        default: return monitor.canStartInitialSetup ? "可以继续" : "尚未开始"
         }
     }
 
@@ -452,11 +495,13 @@ private struct GuideView: View {
                     Text("2. 点击扫描，允许蓝牙权限。没有候选时，打开“显示其他设备”。")
                     Text("3. 选中设备，点击“连接 GATT 并读取标准信息”。")
                     Text("4. 在“连接验证进度”中点击“验证连接与身份”，完成可能出现的系统配对提示。")
-                    Text("5. 保持前台，等待身份验证结果或明确错误，再导出 JSON。认证通过仍不代表业务绑定成功。")
+                    Text("5. 身份验证通过后，点击“继续首次设置”。保持前台，等待手表状态或明确错误，并观察手表是否离开配对页面。")
+                    Text("6. 观察结束后导出 JSON。报告中的首次设置结果、账号绑定状态和写入回执分别记录；设备报告设置完成仍不证明云账号已绑定。")
                 }
                 Section("手机已确认，手表仍等待") {
                     Text("系统蓝牙配对、手表协议认证和业务绑定是不同阶段。标准信息能读取，不能证明后两步已完成，也不能直接证明系统已经持久保存配对。")
-                    Text("0.3.0 会按完整能力消息选择身份流程。协议版本 3–5 可尝试身份挑战及必要的密钥协商；版本 1–2 会明确停止并记录旧密钥路径尚未适配。")
+                    Text("0.4.0 保留协议版本 3–5 的身份验证，并使用本次协商结果继续首次设置。版本 1–2 的旧密钥路径仍未适配。")
+                    Text("首次设置会发送开始设置请求并查询状态。本版尚未实现原厂账号登录、云绑定及完整同步；若手表仍等待，需要结合最新报告判断它停在哪个业务阶段。")
                     Text("系统配对提示不一定每次连接都出现。应根据命令通知、写入回执和协议结果判断当前进展；手表没有再次显示六位码，不能单独判断蓝牙是否连接。")
                 }
                 Section("为什么和安卓不同") {
@@ -465,7 +510,7 @@ private struct GuideView: View {
                     Text("未发现广播、没有标准电量、GATT 连接失败，都不能单独证明手表不兼容。服务存在也不代表该固件支持完整的 BLE 业务绑定，仍需实际回包。")
                 }
                 Section("报告和隐私") {
-                    Text("报告包含所选设备名称、会话匿名标识、系统版本、服务 UUID、传输能力、身份校验结果和逐命令写入计数。不保存原始广播载荷、完整外设标识、验证码、密钥或原始私有载荷。iOS 不向本应用提供蓝牙 MAC 地址。")
+                    Text("报告包含所选设备名称、会话匿名标识、系统版本、服务 UUID、传输能力、身份校验结果、首次设置状态码和逐命令写入计数。不保存原始广播载荷、完整外设标识、验证码、密钥、IV 或原始私有载荷。iOS 不向本应用提供蓝牙 MAC 地址。")
                     Text("报告只在你导出时保存到指定位置。本应用不包含账号、分析 SDK 或网络上传功能。")
                     Text("进入后台会结束扫描并释放连接；返回后请手动重试。导出按钮先生成快照，再打开保存界面。")
                 }

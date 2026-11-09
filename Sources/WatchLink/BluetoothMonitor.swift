@@ -48,6 +48,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     @Published private(set) var readings: [StandardReading] = []
     @Published private(set) var events: [ProbeEvent] = []
     @Published private(set) var isCheckingVendorProtocol = false
+    @Published private(set) var isSettingUp = false
     @Published private(set) var vendorProtocol = VendorProbeSnapshot()
 
     private enum PendingAction { case scan, connect(UUID) }
@@ -71,10 +72,23 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     private var deviceLimitReported = false
     private var vendorCharacteristics: [CBCharacteristic] = []
     private var vendorTransport: VendorGATTTransport?
-    private var vendorDecoder = OppoTransportDecoder(emitAuthenticationMessages: true)
+    private var vendorDecoder = OppoTransportDecoder(emitAuthenticationMessages: true, emitBusinessMessages: true)
     private var authentication: OppoAuthentication?
+    private var businessSession: OppoBusinessSession?
+    private var setupEngine: OppoSetup?
     private var activeVendorWriteIndex: Int?
     private var activeAuthenticationToken: Int?
+    private var activeSetupToken: Int?
+
+    private var isVendorSessionLive: Bool { isCheckingVendorProtocol || businessSession != nil }
+
+    var canStartInitialSetup: Bool {
+        isConnected && phase == .ready && !isCheckingVendorProtocol && !isSettingUp
+            && vendorProtocol.authentication.transportAuthenticated
+            && vendorProtocol.businessSessionState == "READY" && businessSession != nil
+            && vendorTransport?.isReady == true && vendorTransport?.isWriting == false
+            && activeVendorWriteIndex == nil && setupEngine == nil
+    }
 
     var selectedDevice: DiscoveredDevice? {
         devices.first { $0.id == selectedDeviceID }
@@ -101,6 +115,166 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         return "验证连接与身份"
     }
 
+    var initialSetupButtonTitle: String {
+        if let setupEngine { return setupEngine.snapshot.buttonTitle }
+        if !vendorProtocol.authentication.transportAuthenticated { return "请先完成身份验证" }
+        if !canStartInitialSetup { return "请重连并重新验证身份" }
+        return "继续首次设置"
+    }
+
+    /// Start only in the still-live, authenticated connection. This sends the
+    /// original start-setting request, then observes real OOBE state messages.
+    func startInitialSetup() {
+        guard canStartInitialSetup else { return }
+        let engine = OppoSetup()
+        setupEngine = engine
+        isSettingUp = true
+        phase = .vendor
+        vendorProtocol.businessSessionState = "RUNNING"
+        vendorProtocol.status = "INITIAL_SETUP_RUNNING"
+        result = "INITIAL_SETUP_RUNNING"
+        addEvent("开始首次设置：发送原厂开始设置请求，再查询并观察手表状态。账号登录和云绑定尚未执行。")
+        handleSetupActions(engine.start())
+    }
+
+    private func handleSetupActions(_ actions: [OppoSetup.Action],
+                                    transportFailure: VendorGATTTransport.Failure? = nil) {
+        if let setupEngine { vendorProtocol.initialSetup = setupEngine.snapshot }
+        stateText = vendorProtocol.summary
+        for action in actions {
+            guard isSettingUp else { return }
+            switch action {
+            case .send(let command):
+                sendSetupCommand(command)
+            case .observed(let observation):
+                addEvent("收到首次设置状态：\(observation.result)。此状态不代表账号绑定已完成。")
+            case .finished:
+                finishBusinessSession(status: "INITIAL_SETUP_OBSERVED", failure: nil)
+            case .failed(let failure):
+                let error = transportFailure ?? VendorGATTTransport.Failure(
+                    phase: "INITIAL_SETUP", domain: "WatchLink.InitialSetup", code: 3100,
+                    message: "\(failure.code)：\(failure.message)")
+                finishBusinessSession(status: "INITIAL_SETUP_FAILED", failure: error)
+            }
+        }
+    }
+
+    private func sendSetupCommand(_ command: OppoSetup.Command) {
+        guard let session = businessSession, let transport = vendorTransport,
+              transport.isReady, !transport.isWriting, activeVendorWriteIndex == nil,
+              let capabilities = vendorProtocol.authentication.selectedCapabilities else {
+            businessSessionFailed(.init(phase: "SETUP_COMMAND_WRITE", domain: "WatchLink.InitialSetup",
+                                        code: 3002, message: "首次设置所需的当前业务会话已不可用。"))
+            return
+        }
+        do {
+            let plaintext = Data([command.serviceID, command.commandID]) + command.protobuf
+            let payload = try session.sealPayload(plaintext)
+            let limit = min(min(20, capabilities.maxFrameSize),
+                            min(capabilities.maxTransmissionUnit, transport.maximumWriteLength))
+            let fragments = try OppoProtocol.encodePayload(payload, encrypted: session.isEncrypted,
+                                                            maximumFrameLength: limit)
+            guard vendorProtocol.commandWrites.count < 8 else { throw OppoWireError.tooManyFragments }
+            var receipt = VendorCommandWriteSnapshot(commandID: Int(command.commandID),
+                                                      stage: command.phase.rawValue, frameCount: fragments.count,
+                                                      queuedAt: Date())
+            receipt.serviceID = Int(command.serviceID)
+            receipt.encrypted = session.isEncrypted
+            vendorProtocol.commandWrites.append(receipt)
+            activeVendorWriteIndex = vendorProtocol.commandWrites.count - 1
+            activeAuthenticationToken = nil
+            activeSetupToken = command.token
+            addEvent("提交首次设置业务命令 \(command.serviceID)/\(command.commandID)，共 \(fragments.count) 个分片。")
+            if !transport.send(fragments: fragments, intervalMilliseconds: max(10, capabilities.interval)),
+               isSettingUp {
+                vendorTransportFailed(.init(phase: "SETUP_COMMAND_WRITE", domain: "WatchLink.InitialSetup",
+                                             code: 3003, message: "首次设置命令没有进入发送队列。"))
+            }
+        } catch {
+            businessSessionFailed(.init(phase: "SETUP_FRAME_ENCODING", domain: "WatchLink.InitialSetup",
+                                        code: 3004, message: "首次设置消息无法按当前加密模式和分片限额编码。"))
+        }
+    }
+
+    private func receiveBusinessMessage(_ message: OppoWireMessage) {
+        guard let session = businessSession else { return }
+        do {
+            let payload = Data([message.serviceID, message.commandID]) + message.protobuf
+            _ = try session.openPayload(payload, encrypted: false)
+            routeBusinessMessage(message)
+        } catch {
+            businessSessionFailed(.init(phase: "BUSINESS_ENCRYPTION", domain: "WatchLink.Session",
+                                        code: 3005, message: "收到的业务消息与已协商的加密模式不一致。"))
+        }
+    }
+
+    private func receiveEncryptedBusinessMessage(_ message: OppoEncryptedMessage) {
+        guard let session = businessSession else {
+            vendorProtocol.ignoredBusinessMessageCount += 1
+            return
+        }
+        do {
+            let plaintext = try session.openPayload(message.payload, encrypted: true)
+            guard plaintext.count >= 2 else { throw OppoWireError.messageTooLarge }
+            let bytes = Array(plaintext)
+            let decoded = OppoWireMessage(
+                serviceID: bytes[0], commandID: bytes[1], protobuf: Data(bytes.dropFirst(2)),
+                streamOffset: message.streamOffset, controlFlags: message.controlFlags,
+                frameCount: message.frameCount, frameShape: message.frameShape,
+                crcValidation: message.crcValidation)
+            routeBusinessMessage(decoded)
+        } catch {
+            businessSessionFailed(.init(phase: "BUSINESS_DECRYPT", domain: "WatchLink.Session",
+                                        code: 3006, message: "业务消息无法使用本连接的协商参数验证并解密。"))
+        }
+    }
+
+    private func routeBusinessMessage(_ message: OppoWireMessage) {
+        guard message.serviceID == 11, [UInt8(7), 11, 12].contains(message.commandID & 0x7f),
+              isSettingUp, let setupEngine else {
+            vendorProtocol.ignoredBusinessMessageCount += 1
+            return
+        }
+        handleSetupActions(setupEngine.receive(message))
+    }
+
+    private func businessSessionFailed(_ error: VendorGATTTransport.Failure) {
+        if isSettingUp, let setupEngine {
+            let actions = setupEngine.abort(code: "BUSINESS_CHANNEL_FAILED", message: error.message)
+            handleSetupActions(actions, transportFailure: error)
+            if !isSettingUp { return }
+        }
+        finishBusinessSession(status: "BUSINESS_SESSION_FAILED", failure: error)
+    }
+
+    private func finishBusinessSession(status: String, failure: VendorGATTTransport.Failure?) {
+        if let setupEngine { vendorProtocol.initialSetup = setupEngine.snapshot }
+        recordVendorNotifications()
+        _ = vendorDecoder.finish()
+        vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
+        businessSession?.invalidate()
+        businessSession = nil
+        authentication?.cancel()
+        authentication = nil
+        vendorProtocol.businessSessionState = failure == nil ? "ENDED" : "FAILED"
+        vendorProtocol.status = status
+        vendorProtocol.error = failure
+        isSettingUp = false
+        isCheckingVendorProtocol = false
+        cancelTimer()
+        vendorTransport?.cancel()
+        vendorDecoder.reset()
+        activeSetupToken = nil
+        activeAuthenticationToken = nil
+        // Keep an in-flight receipt available for a genuine late ATT callback;
+        // the cancelled transport cannot resume or advance the protocol.
+        phase = isConnected ? .ready : .idle
+        result = status
+        stateText = vendorProtocol.summary
+        addEvent(failure.map { "首次设置业务通道已停止：\($0.description)" }
+                 ?? "本轮首次设置观察已结束：\(vendorProtocol.initialSetup.summary)。账号绑定未被认定成功。")
+    }
+
     /// One complete verification session per GATT connection. All subsequent
     /// identity commands are serialized behind real ATT completion callbacks.
     func checkVendorProtocol() {
@@ -115,15 +289,21 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         vendorDecoder.reset()
         authentication?.cancel()
         authentication = nil
+        businessSession?.invalidate()
+        businessSession = nil
+        setupEngine?.cancel()
+        setupEngine = nil
+        isSettingUp = false
         activeVendorWriteIndex = nil
         activeAuthenticationToken = nil
+        activeSetupToken = nil
         vendorProtocol.status = "SUBSCRIBING"
         vendorProtocol.startedAt = Date()
         isCheckingVendorProtocol = true
         phase = .vendor
         result = "VENDOR_PROTOCOL_SUBSCRIBING"
         stateText = vendorProtocol.summary
-        addEvent("开始连接与身份验证：先检查协议能力，再按手表实际版本验证本地身份。业务绑定和首次设置尚未实现。")
+        addEvent("开始连接与身份验证：先检查协议能力，再按手表实际版本验证身份；通过后可继续首次设置。账号绑定尚未接入。")
 
         let transport = VendorGATTTransport(
             peripheral: peripheral, commandWrite: write, commandNotify: notify, fileNotify: fileNotify,
@@ -133,19 +313,19 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                 self.beginVendorQuery()
             },
             onReceived: { [weak self] channel, data in
-                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                guard let self, self.generation == token, self.isVendorSessionLive else { return }
                 self.receiveVendorData(channel, data: data)
             },
             onFragmentSubmitted: { [weak self] index in
-                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                guard let self, self.generation == token, self.isVendorSessionLive else { return }
                 self.vendorFragmentSubmitted(index)
             },
             onWriteComplete: { [weak self] in
-                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                guard let self, self.generation == token, self.isVendorSessionLive else { return }
                 self.vendorWriteCompleted()
             },
             onFailure: { [weak self] error in
-                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                guard let self, self.generation == token, self.isVendorSessionLive else { return }
                 self.vendorTransportFailed(error)
             }
         )
@@ -159,6 +339,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                                                   frameCount: 1, queuedAt: Date()))
         activeVendorWriteIndex = vendorProtocol.commandWrites.count - 1
         activeAuthenticationToken = nil
+        activeSetupToken = nil
         if !transport.send(fragments: [OppoProtocol.transportConsultRequest], intervalMilliseconds: 10), isCheckingVendorProtocol {
             vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
                                     code: 1002, message: "能力查询没有进入发送队列。"))
@@ -173,7 +354,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             return
         }
         guard fragmentIndex == 0 else { return }
-        if let token = activeAuthenticationToken, let authentication {
+        if let token = activeSetupToken, let setupEngine {
+            setTimer(seconds: 45) { [weak self] in
+                guard let self, self.isSettingUp, let setupEngine = self.setupEngine else { return }
+                self.handleSetupActions(setupEngine.timeout())
+            }
+            handleSetupActions(setupEngine.didSubmit(
+                token: token, streamOffset: vendorDecoder.diagnostics.receivedByteCount))
+        } else if let token = activeAuthenticationToken, let authentication {
             setTimer(seconds: 45) { [weak self] in
                 guard let self, self.isCheckingVendorProtocol, let authentication = self.authentication else { return }
                 self.handleAuthenticationActions(authentication.timeout())
@@ -208,10 +396,15 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             return
         }
         let token = activeAuthenticationToken
+        let setupToken = activeSetupToken
         let commandID = vendorProtocol.commandWrites[index].commandID
         activeVendorWriteIndex = nil
         activeAuthenticationToken = nil
-        if let token, let authentication {
+        activeSetupToken = nil
+        if let setupToken, let setupEngine {
+            addEvent("首次设置命令 \(commandID) 的全部分片已收到 ATT 确认；设备状态仍由实际回包判断。")
+            handleSetupActions(setupEngine.writeCompleted(token: setupToken, succeeded: true))
+        } else if let token, let authentication {
             addEvent("身份流程命令 \(commandID) 的全部分片已收到 ATT 确认；设备协议校验单独判断。")
             handleAuthenticationActions(authentication.writeCompleted(token: token, succeeded: true))
         } else {
@@ -220,7 +413,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func beginAuthenticationIfReady() {
-        guard isCheckingVendorProtocol, authentication == nil,
+        guard isCheckingVendorProtocol, authentication == nil, !vendorProtocol.authentication.transportAuthenticated,
               vendorProtocol.attWriteAcknowledged, activeVendorWriteIndex == nil,
               let transport = vendorTransport, transport.isReady, !transport.isWriting else { return }
         let choice: VendorCapabilitySelection.Choice
@@ -273,16 +466,23 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                 vendorProtocol.authentication.transportAuthenticated = true
                 vendorProtocol.authentication.completedAt = Date()
                 vendorProtocol.vendorAuthentication = "PASSED"
-                vendorProtocol.status = "AUTHENTICATED_BINDING_PENDING"
-                result = "TRANSPORT_AUTHENTICATED_BINDING_PENDING"
-                stateText = vendorProtocol.summary
+                guard let session = authentication?.takeBusinessSession() else {
+                    vendorProbeFailed(.init(phase: "BUSINESS_SESSION_TRANSFER", domain: "WatchLink.Session",
+                                            code: 3001, message: "身份已通过，但没有可移交的业务会话。请重新连接。"))
+                    return
+                }
+                businessSession = session
+                vendorProtocol.businessSessionState = "READY"
+                vendorProtocol.businessEncrypted = session.isEncrypted
+                vendorProtocol.status = "READY_FOR_INITIAL_SETUP"
+                result = "READY_FOR_INITIAL_SETUP"
                 isCheckingVendorProtocol = false
                 phase = .ready
                 cancelTimer()
                 recordVendorNotifications()
-                vendorTransport?.cancel()
                 authentication = nil
-                addEvent("已完成协议版本 \(completion.protocolVersion) 的传输身份验证；加密协商\(completion.encryptedTransport ? "已完成" : "未被手表要求")。业务绑定、首次设置和健康同步尚未执行。")
+                stateText = vendorProtocol.summary
+                addEvent("协议版本 \(completion.protocolVersion) 的身份验证已通过；业务加密\(completion.encryptedTransport ? "已启用" : "未被手表要求")。当前连接已保留，可点击继续首次设置；账号绑定与健康同步尚未执行。")
             case .failed(let failure):
                 vendorProtocol.authentication.error = failure
                 vendorProbeFailed(transportFailure ?? .init(
@@ -330,7 +530,12 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func vendorTransportFailed(_ failure: VendorGATTTransport.Failure) {
-        if let authentication, let token = activeAuthenticationToken {
+        if isSettingUp, let setupEngine, let token = activeSetupToken {
+            handleSetupActions(setupEngine.writeCompleted(token: token, succeeded: false), transportFailure: failure)
+            if isSettingUp { businessSessionFailed(failure) }
+        } else if businessSession != nil {
+            businessSessionFailed(failure)
+        } else if let authentication, let token = activeAuthenticationToken {
             let actions = authentication.writeCompleted(token: token, succeeded: false)
             handleAuthenticationActions(actions, transportFailure: failure)
             if isCheckingVendorProtocol { vendorProbeFailed(failure) }
@@ -401,14 +606,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     /// Call before showing the share sheet to preserve the current connection state.
     func makeReport() -> Data {
         let report = ProbeReport(
-            schemaVersion: 4,
+            schemaVersion: 5,
             generatedAt: Date(),
             platform: PlatformSnapshot(
                 system: UIDevice.current.systemName,
                 systemVersion: UIDevice.current.systemVersion,
                 deviceType: UIDevice.current.model,
-                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0",
-                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "4"
+                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0",
+                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "5"
             ),
             capabilities: CapabilitySnapshot(),
             selectedDevice: selectedDevice.map { DeviceSnapshot(device: $0, salt: sessionSalt) },
@@ -421,7 +626,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             services: serviceRows,
             standardReadings: readings,
             events: events,
-            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷、验证码、密钥或原始私有载荷。仅记录传输能力、身份校验阶段与结果、逐命令写入计数及有界帧头。身份随机值、挑战、加密证明和会话密钥只在内存中处理，不写入报告。查询前能力单独标注来源，不作为查询应答。设备名和标准设备信息仍可能识别你的设备。",
+            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷、验证码、密钥或原始私有载荷。仅记录传输能力、身份验证结果、首次设置状态码、逐命令写入计数及有界帧头。身份随机值、挑战、加密证明、会话密钥和 IV 仅在本连接内存中处理，不写入报告。前置主动消息单独标注来源，不作为本次查询应答。设备名和标准设备信息仍可能识别你的设备。",
             vendorProtocol: vendorProtocol
         )
         return report.encoded()
@@ -450,10 +655,18 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     private func retireRadio() {
         recordVendorNotifications()
-        if isCheckingVendorProtocol {
+        if isVendorSessionLive {
             _ = vendorDecoder.finish()
             vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
-            vendorProtocol.status = "INTERRUPTED"
+            if isSettingUp {
+                setupEngine?.cancel()
+                if let setupEngine { vendorProtocol.initialSetup = setupEngine.snapshot }
+                vendorProtocol.status = "INITIAL_SETUP_INTERRUPTED"
+            } else if isCheckingVendorProtocol {
+                vendorProtocol.status = "INTERRUPTED"
+            } else {
+                vendorProtocol.status = "BUSINESS_SESSION_CLOSED"
+            }
         }
         if let authentication {
             authentication.cancel()
@@ -464,8 +677,15 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             }
         }
         authentication = nil
+        businessSession?.invalidate()
+        businessSession = nil
+        if vendorProtocol.businessSessionState == "READY" || vendorProtocol.businessSessionState == "RUNNING" {
+            vendorProtocol.businessSessionState = "INVALIDATED"
+        }
+        isSettingUp = false
         activeVendorWriteIndex = nil
         activeAuthenticationToken = nil
+        activeSetupToken = nil
         isCheckingVendorProtocol = false
         vendorTransport?.cancel()
         vendorTransport = nil
@@ -496,6 +716,8 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func clearObservations() {
+        setupEngine?.cancel()
+        setupEngine = nil
         serviceRows = []
         readings = []
         events = []
@@ -648,12 +870,12 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     func centralManager(_ manager: CBCentralManager, didDisconnectPeripheral device: CBPeripheral, error: Error?) {
         guard manager === central, device === peripheral else { return }
-        if isCheckingVendorProtocol {
+        if isVendorSessionLive {
             let detail = error as NSError?
             vendorProtocol.error = .init(phase: "LINK_DISCONNECTED",
                                          domain: detail?.domain ?? "WatchLink.ProtocolProbe",
                                          code: detail?.code ?? 1005,
-                                         message: "协议检查期间 GATT 连接断开。")
+                                         message: "连接验证或首次设置期间 GATT 连接断开。")
         }
         fail("GATT 连接已断开\(errorSuffix(error)) · 观测已保留", result: "GATT_DISCONNECTED")
     }
@@ -792,6 +1014,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                              message: "ATT 写入回调返回错误：\(detail.localizedDescription)")
             }
             if vendorProtocol.commandWrites[index].recordCallback(error: failure, at: Date()),
+               vendorProtocol.commandWrites[index].serviceID == 1,
                vendorProtocol.commandWrites[index].commandID == 1 {
                 if vendorProtocol.recordWriteCompletion(error: failure, at: Date()) {
                     addEvent(failure == nil ? "能力查询的 ATT 写入已确认。" : "能力查询的 ATT 写入返回错误。")
@@ -850,30 +1073,38 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             return
         }
         for event in decodedEvents {
-            guard isCheckingVendorProtocol else { return }
+            guard isVendorSessionLive else { return }
             switch event {
             case .capabilities(let capabilities):
                 vendorProtocol.capabilities = capabilities
                 vendorProtocol.responseAt = Date()
                 vendorProtocol.responseCorrelation = "MESSAGE_STARTED_AFTER_QUERY_NO_TRANSACTION_ID"
-                if authentication == nil {
+                if isCheckingVendorProtocol && authentication == nil {
                     vendorProtocol.status = "CAPABILITIES_WAITING_FOR_WRITE"
                     addEvent("已取得完整有效的协议能力消息，等待查询写入完成后进入身份验证。")
                     beginAuthenticationIfReady()
                 }
             case .message(let message):
                 if let authentication { handleAuthenticationActions(authentication.receive(message)) }
+                else if message.serviceID == 11 { receiveBusinessMessage(message) }
+                else { vendorProtocol.ignoredBusinessMessageCount += 1 }
+            case .encryptedMessage(let message):
+                receiveEncryptedBusinessMessage(message)
             case .rejected(let error):
                 vendorProbeFailed(.init(phase: "PROTOCOL_DECODE", domain: "WatchLink.OppoProtocol",
                                         code: 1004, message: "协议接收停止：\(error.diagnosticMessage)"))
             }
         }
-        guard isCheckingVendorProtocol else { return }
+        guard isVendorSessionLive else { return }
         beginAuthenticationIfReady()
         stateText = vendorProtocol.summary
     }
 
     private func vendorProbeFailed(_ error: VendorGATTTransport.Failure) {
+        if vendorProtocol.authentication.transportAuthenticated {
+            businessSessionFailed(error)
+            return
+        }
         recordVendorNotifications()
         _ = vendorDecoder.finish()
         vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics

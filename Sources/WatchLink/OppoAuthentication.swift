@@ -108,6 +108,7 @@ final class OppoAuthentication {
     private var identityKey: Data?
     private var challenge: Data?
     private var rsa: RSAContext?
+    private var businessSession: OppoBusinessSession?
 
     private(set) var phase: Phase = .idle
     private(set) var diagnostics = Diagnostics()
@@ -118,6 +119,19 @@ final class OppoAuthentication {
 
     init(dependencies: Dependencies = .live) {
         self.dependencies = dependencies
+    }
+
+    deinit { businessSession?.invalidate() }
+
+    /// Single ownership transfer after all required protocol checks AND the
+    /// final physical write acknowledgement. Before completion or after a
+    /// previous transfer it returns nil. The owner must invalidate the returned
+    /// context when this connection ends; no secret is included in Completion.
+    func takeBusinessSession() -> OppoBusinessSession? {
+        guard phase == .completed else { return nil }
+        let session = businessSession
+        businessSession = nil
+        return session
     }
 
     private var isActive: Bool {
@@ -338,6 +352,7 @@ final class OppoAuthentication {
             }
             keyExchangeVerified = true
             self.rsa = nil
+            businessSession = try OppoBusinessSession(key32: key, iv16: iv)
             let confirmation = try OppoProtobufWriter.encode([5: .varint(1)])
             return send(command: 37, body: confirmation, phase: .sessionConfirm)
         } catch {
@@ -355,9 +370,19 @@ final class OppoAuthentication {
     }
 
     private func complete() -> [Action] {
+        if requiresSessionKeys {
+            guard identityVerified, keyExchangeVerified, businessSession?.isEncrypted == true else {
+                return fail(code: "BUSINESS_SESSION_UNAVAILABLE", message: "身份验证未能提供本次业务会话。")
+            }
+        } else {
+            guard identityVerified else {
+                return fail(code: "BUSINESS_SESSION_UNAVAILABLE", message: "身份验证未能提供本次业务会话。")
+            }
+            businessSession = OppoBusinessSession()
+        }
         let completion = Completion(protocolVersion: protocolVersion,
                                     encryptedTransport: requiresSessionKeys)
-        releaseEphemeralState()
+        releaseEphemeralState(keepingBusinessSession: true)
         phase = .completed
         return [.completed(completion)]
     }
@@ -375,12 +400,16 @@ final class OppoAuthentication {
         return []
     }
 
-    private func releaseEphemeralState() {
+    private func releaseEphemeralState(keepingBusinessSession: Bool = false) {
         pending = nil
         clientNonce = nil
         identityKey = nil
         challenge = nil
         rsa = nil
+        if !keepingBusinessSession {
+            businessSession?.invalidate()
+            businessSession = nil
+        }
     }
 
     private static func equalBytes(_ lhs: Data, _ rhs: Data) -> Bool {

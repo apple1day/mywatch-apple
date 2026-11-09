@@ -44,8 +44,8 @@ final class ModelsTests: XCTestCase {
         let identifier = UUID(uuidString: "12345678-1234-5678-1234-567812345678")!
         let device = DiscoveredDevice(id: identifier, name: "OnePlus Watch A1B2", rssi: -45,
                                       isCandidate: true, advertisedServices: ["180F"], isConnectable: true)
-        let report = ProbeReport(schemaVersion: 1, generatedAt: Date(timeIntervalSince1970: 0),
-                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.1.0", appBuild: "1"),
+        let report = ProbeReport(schemaVersion: 5, generatedAt: Date(timeIntervalSince1970: 0),
+                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.4.0", appBuild: "5"),
                                  capabilities: CapabilitySnapshot(), selectedDevice: DeviceSnapshot(device: device, salt: "session"),
                                  observations: ObservationSnapshot(stateText: "GATT 检测完成", bluetoothState: "蓝牙已开启", scanningAtExport: false, connectingAtExport: false,
                                                                    gattConnectedAtExport: true, gattConnectionObservedThisAttempt: true, result: "GATT_DIAGNOSTICS_COMPLETE"),
@@ -57,6 +57,8 @@ final class ModelsTests: XCTestCase {
         let capabilities = try XCTUnwrap(object["capabilities"] as? [String: Any])
         XCTAssertEqual(capabilities["classicRFCOMM"] as? String, WatchProfile.classicUnavailable)
         XCTAssertEqual(capabilities["vendorAuthentication"] as? String, "EXPERIMENTAL_PROTOCOL_3_TO_5")
+        XCTAssertEqual(capabilities["initialSetup"] as? String, "EXPERIMENTAL_START_AND_STATE_OBSERVATION")
+        XCTAssertEqual(capabilities["accountBinding"] as? String, WatchProfile.notImplemented)
         XCTAssertEqual(capabilities["healthSync"] as? String, WatchProfile.notImplemented)
         let observation = try XCTUnwrap(object["observations"] as? [String: Any])
         XCTAssertEqual(observation["gattConnectedAtExport"] as? Bool, true)
