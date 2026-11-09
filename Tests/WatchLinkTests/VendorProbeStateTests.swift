@@ -283,6 +283,44 @@ final class VendorCommandAndCapabilityTests: XCTestCase {
         XCTAssertEqual(restored.capabilityTimeoutReason, "NO_NOTIFICATIONS")
     }
 
+    func testUnstartedProtocolNeverDisplaysAsAwaitingACapabilityReply() {
+        var snapshot = VendorProbeSnapshot()
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "尚未开始")
+        snapshot.profileDiscoveryCompleted = true
+        snapshot.profileAvailable = true
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "尚未开始")
+        XCTAssertEqual(snapshot.capabilityQuery.submittedAttempts, 0)
+        XCTAssertFalse(snapshot.requestSubmitted)
+    }
+
+    func testCapabilityProgressDistinguishesSubscriptionWaitingFailureAndInterruption() {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.status = "SUBSCRIBING"
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "正在开启通知")
+        snapshot.status = "WAITING_FOR_RESPONSE"
+        snapshot.requestSubmitted = true
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "等待结果")
+        snapshot.status = "FAILED"
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "未取得")
+        snapshot.status = "INTERRUPTED"
+        XCTAssertEqual(snapshot.capabilityProgressLabel, "已中断")
+    }
+
+    func testLaterFailureKeepsPreviouslyObservedCapabilityProgress() {
+        for source in 0..<3 {
+            var snapshot = VendorProbeSnapshot()
+            snapshot.status = "FAILED"
+            switch source {
+            case 0: snapshot.capabilities = capability()
+            case 1: snapshot.decoderDiagnostics.unsolicitedCapabilities = capability()
+            default: snapshot.authentication.selectedCapabilities = capability()
+            }
+            XCTAssertEqual(snapshot.capabilityProgressLabel, "已取得")
+            XCTAssertFalse(snapshot.authentication.transportAuthenticated)
+            XCTAssertEqual(snapshot.accountBinding, "NOT_IMPLEMENTED")
+        }
+    }
+
     private func capability(version: Int = 5, support: UInt32 = 3) -> OppoTransportCapabilities {
         OppoTransportCapabilities(protocolVersion: version, maxFrameSize: 20, maxTransmissionUnit: 20,
                                   interval: 10, supportProtocol: support, commandID: 0x81, controlFlags: 0,

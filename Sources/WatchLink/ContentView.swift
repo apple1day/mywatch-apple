@@ -98,7 +98,7 @@ struct ContentView: View {
                 Text("一代手表连接")
                     .font(.title.bold())
                     .accessibilityIdentifier("homeTitle")
-                Text("iPhone 连接验证版 · 0.4.1")
+                Text("iPhone 连接验证版 · 0.4.2")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Text("发现设备，记录真实的连接结果。")
@@ -201,6 +201,9 @@ struct ContentView: View {
             Text(monitor.selectedDevice?.name ?? "未选择设备")
                 .font(.title3.weight(.semibold))
                 .textSelection(.enabled)
+            if let failure = monitor.gattFailure {
+                GATTFailureNotice(failure: failure) { monitor.startScan() }
+            }
             if monitor.isConnected {
                 Text("蓝牙通道已连接 · 账号绑定未接入")
                     .font(.subheadline.weight(.medium))
@@ -232,9 +235,9 @@ struct ContentView: View {
         WatchCard {
             Label("连接验证进度", systemImage: "list.bullet")
                 .font(.headline)
-            verificationRow("蓝牙通道", state: monitor.isConnected ? "已连接" : "尚未连接",
+            verificationRow("蓝牙通道", state: gattProgressLabel,
                             complete: monitor.isConnected)
-            verificationRow("协议能力", state: observedCapabilities == nil ? "等待结果" : "已取得",
+            verificationRow("协议能力", state: monitor.vendorProtocol.capabilityProgressLabel,
                             complete: observedCapabilities != nil)
             verificationRow("传输身份", state: authenticationLabel,
                             complete: monitor.vendorProtocol.authentication.transportAuthenticated)
@@ -335,6 +338,15 @@ struct ContentView: View {
         case "INTERRUPTED": return "已中断"
         default: return monitor.canStartInitialSetup ? "可以继续" : "尚未开始"
         }
+    }
+
+    private var gattProgressLabel: String {
+        if monitor.isConnected { return "已连接" }
+        if monitor.isConnecting { return "正在连接" }
+        if monitor.gattFailure?.requiresPairingRecovery == true { return "需要重新配对" }
+        if monitor.gattFailure?.stage == .disconnection { return "已断开" }
+        if monitor.gattFailure != nil { return "连接未完成" }
+        return "尚未连接"
     }
 
     private var observedCapabilities: OppoTransportCapabilities? {
@@ -497,6 +509,50 @@ private struct WatchGlyph: View {
     }
 }
 
+private struct PairingRecoverySteps: View {
+    var body: some View {
+        ForEach(Array(GATTConnectionFailure.pairingRecoverySteps.enumerated()), id: \.offset) { index, step in
+            HStack(alignment: .top, spacing: 8) {
+                Text("\(index + 1).")
+                Text(step).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct GATTFailureNotice: View {
+    let failure: GATTConnectionFailure
+    let rescan: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(failure.title, systemImage: "exclamationmark.triangle")
+                .font(.subheadline.weight(.semibold))
+                .accessibilityIdentifier("gattFailureTitle")
+            Text(failure.message)
+                .font(.footnote)
+                .fixedSize(horizontal: false, vertical: true)
+            if failure.requiresPairingRecovery {
+                PairingRecoverySteps().font(.footnote)
+                Text("完成系统操作后再点下方重新扫描。App 无法确认系统中的旧配对是否已移除。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if let domain = failure.domain, let code = failure.code {
+                Text("\(domain) · 错误码 \(code)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Button("重新扫描手表", action: rescan)
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("gattRecoveryScanButton")
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 16))
+        .accessibilityIdentifier("gattFailureNotice")
+    }
+}
+
 private struct GuideView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -504,6 +560,13 @@ private struct GuideView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("连接失败：配对信息已移除") {
+                    Text("如果报告为 CBErrorDomain、错误码 14，表示系统报告手表端已移除配对信息。请按以下步骤重新建立系统配对。")
+                        .accessibilityIdentifier("pairingRecoveryGuide")
+                    PairingRecoverySteps()
+                    Text("当前 App 的连接方式不能直接清除系统配对记录。若系统蓝牙列表没有这只手表或没有 ⓘ，请保留诊断报告，并核对系统蓝牙页面中的设备记录。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section("先完成一次连接检查") {
                     Text("1. 让手表亮屏，靠近手机，保留现有绑定和数据。")
                     Text("2. 点击扫描，允许蓝牙权限。没有候选时，打开“显示其他设备”。")
@@ -514,7 +577,7 @@ private struct GuideView: View {
                 }
                 Section("手机已确认，手表仍等待") {
                     Text("系统蓝牙配对、手表协议认证和业务绑定是不同阶段。标准信息能读取，不能证明后两步已完成，也不能直接证明系统已经持久保存配对。")
-                    Text("0.4.1 保留协议版本 3–5 的身份验证，并使用本次协商结果继续首次设置。版本 1–2 的旧密钥路径仍未适配。")
+                    Text("0.4.2 保留协议版本 3–5 的身份验证，并使用本次协商结果继续首次设置。版本 1–2 的旧密钥路径仍未适配。")
                     Text("能力查询最多发送 4 次；未取得有效能力时，首片提交 2 秒后、且上一条已完整写入确认，才会重试。收到有效能力后停止新增重试；整个能力等待窗口最多 45 秒。消息计数为 0 时也会显示。")
                     Text("首次设置会发送开始设置请求并查询状态。本版尚未实现原厂账号登录、云绑定及完整同步；若手表仍等待，需要结合最新报告判断它停在哪个业务阶段。")
                     Text("系统配对提示不一定每次连接都出现。应根据命令通知、写入回执和协议结果判断当前进展；手表没有再次显示六位码，不能单独判断蓝牙是否连接。")

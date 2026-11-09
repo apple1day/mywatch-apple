@@ -171,6 +171,9 @@ struct ObservationSnapshot: Codable, Equatable {
     let gattConnectedAtExport: Bool
     let gattConnectionObservedThisAttempt: Bool
     let result: String
+    /// Present only when Core Bluetooth reports a connection failure or drop.
+    /// Earlier reports decode without this field; NSError userInfo is excluded.
+    var gattFailure: GATTConnectionFailure? = nil
 }
 
 struct ProbeReport: Codable, Equatable {

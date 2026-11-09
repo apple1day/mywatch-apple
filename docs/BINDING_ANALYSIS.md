@@ -1,11 +1,13 @@
 # 一代国行 OnePlus Watch：连接、身份与绑定证据
 
-更新：2026-11-09。本文记录 WatchLink **0.4.1（构建 6，报告 schema 6）** 的实现边界及后续协议工作的依据。分析来自用户提供的欢太健康 APK、经脱敏归纳的实机报告与照片，以及 Apple 官方文档；没有运行目标 APK 或其原生库。
+更新：2026-11-09。本文记录 WatchLink **0.4.2（构建 7，报告 schema 7）** 的实现边界及后续协议工作的依据。分析来自用户提供的欢太健康 APK、经脱敏归纳的实机报告与照片，以及 Apple 官方文档；没有运行目标 APK 或其原生库。
 
-**早前照片显示协议版本 5、传输身份“已通过”，最新 18:03 截图却在取得完整能力之前停止；身份和首次设置尚未开始，不能称为最后一步登录失败。0.4.1 针对能力查询仅发送一次的实现缺口，补上相同请求的有界重试和接收诊断。0.4.0 加入的首次设置开始与状态查询继续保留。账号登录、云绑定及完整首次设置仍未实现；目前尚无与 18:03 截图对应的新版本完整 JSON，不能断定本次失败的根因。**
+**最新 0.4.1 完整报告显示 GATT 请求后约 1 秒收到 `CBErrorDomain / 14`，本轮未连接、未发现服务、未提交能力查询。该错误表示系统报告对端已移除配对信息，不能据此判断由谁或什么操作触发。0.4.2 增加这类连接错误的恢复指导、结构化诊断和未开始阶段的准确显示；用户仍须在系统设置中处理对应配对记录。此前能力查询重试、身份认证、首次设置开始与状态查询继续保留。账号登录、云绑定及完整首次设置仍未实现；本版没有把显示恢复步骤当作系统配对或实表连接已经恢复。**
 
-## 0. 0.4.1 的实际实现与门禁
+## 0. 0.4.2 的实际实现与门禁
 
+- GATT 连接／断开回调独立保存为 `observations.gattFailure`，包含 `stage / domain / code / occurredAt / errorIdentifier`。只有域与错误码均匹配时，才识别为 `PEER_REMOVED_PAIRING_INFORMATION` 并显示对应恢复步骤；不把其他域的数字 14 当成同一错误。
+- 连接按钮附近显示本轮失败原因，并提供重新扫描入口。系统配对记录由用户在设置中处理；本版不自动清除配对信息。失败事实在本轮报告中保留，实际开始新的扫描／连接或切换目标才开始新的观测；查看恢复说明不代表恢复成功。
 - `VendorCapabilityQuery` 管理同一连接中 `1/1` 的首发和最多 3 次重试。每次实际提交至少 2 秒且全部 ATT 分片确认后，尚未取得完整有效能力才允许重发。能力一旦有效就停止安排新重试；已排队或提交的当前查询仍须完成，首次主动能力也不跳过首发查询及确认。
 - `OppoAuthentication` 是一次性身份状态机：真实完整能力 → `1/24` 随机值 → `1/25` 反码挑战 → 按能力位决定 `1/36` RSA / `1/37` AES 会话证明 → `1/37 state=1` 写确认。
 - 查询必须实际获得 ATT 确认才开始身份流程。查询后的能力优先；查询前主动能力也可用于版本选择，但来源独立记录，不能追认为查询应答。先校验同一通知批次和历史观测中的能力一致性，再处理可能完成认证的回复；矛盾参数会停止流程。
@@ -18,8 +20,8 @@
 - 用户点击“继续首次设置”后，`OppoSetup` 才发送 `11/7` 的 `08 01 10 02`；收到整条命令的全部 ATT 确认后发送一次空 protobuf 的 `11/11`。查询写确认前的有效新状态有限缓存，写失败不采用；查询前开始的状态另存为 `preQueryObservation`。
 - 业务封装严格遵循实际协商模式。加密分支先将完整 SID/CID/protobuf 用 AES 封装，再分片，每片带 `0x40`；收齐并检查 CRC 后才解密。已协商加密时不退回明文，跨片加密标志变化或模式不符不会被当作有效设置状态。
 - `11/11`、`11/12` 的有效状态 `0`、`10...59` 保持待完成；仅 `60` 标记 `DEVICE_SETUP_FINISHED_REPORTED`。查询首片实际提交后固定观察 45 秒，不因状态通知延长。到期仍在进行则记 `DEVICE_SETUP_PENDING`，未知状态记 `DEVICE_STATE_UNRECOGNIZED`，没有本轮有效状态则明确超时；所有结果均保留 `accountBinding=NOT_IMPLEMENTED`。
-- schema 4 的 `authentication` 与 `commandWrites`、schema 5 的 `initialSetup / businessSessionState / businessEncrypted` 及逐命令 `serviceID / encrypted` 保留；schema 6 新增 `capabilityQuery` 与能力查询记录的 `queryAttempt`。只记录阶段、来源、数值状态、证明结果与 ATT 分片计数，不保存 nonce、挑战、密钥、验证密文或原始 protobuf。
-- 界面区分选择设备、GATT、能力、传输身份、首次设置与账号绑定。按钮按真实阶段和终态显示文案，灰色本身不是成功标志。命令／文件收包数在为 0 时也显示，能力失败按实际接收事实分类；导出显示版本及生成时间，文件名包含 `v0.4.1-b6-` 和时间，方便核对同一轮报告。
+- schema 4 的 `authentication` 与 `commandWrites`、schema 5 的 `initialSetup / businessSessionState / businessEncrypted`、schema 6 的 `capabilityQuery / queryAttempt` 保留；schema 7 新增 `observations.gattFailure`。只记录阶段、来源、数值状态、证明结果、ATT 分片计数及有界系统错误信息，不保存 nonce、挑战、密钥、验证密文、原始 protobuf 或 `NSError.userInfo`。
+- 界面区分选择设备、GATT、能力、传输身份、首次设置与账号绑定。按钮按真实阶段和终态显示文案，灰色本身不是成功标志。命令／文件收包数在为 0 时也显示，能力失败按实际接收事实分类；导出显示版本及生成时间，文件名包含 `v0.4.2-b7-` 和时间，方便核对同一轮报告。
 
 实现入口为 [`VendorCapabilityQuery`](../Sources/WatchLink/VendorCapabilityQuery.swift)、[`OppoAuthentication`](../Sources/WatchLink/OppoAuthentication.swift)、[`OppoBusinessSession`](../Sources/WatchLink/OppoBusinessSession.swift)、[`OppoProtocol`](../Sources/WatchLink/OppoProtocol.swift)、[`OppoSetup`](../Sources/WatchLink/OppoSetup.swift) 与 [`BluetoothMonitor`](../Sources/WatchLink/BluetoothMonitor.swift)。自动检查结果以本次提交的 CI 为准；测试向量来自独立重建和标准向量，不能冒称官方或手表抓包。
 
@@ -39,18 +41,38 @@
 
 **此前身份通过的用户照片**进一步显示：App 的蓝牙通道已连接、协议能力已取得、传输身份已通过，协议版本显示为 5；手表仍停留在“手动配对／请选择该手表配对”画面。这是一次真实界面观测，说明曾推进到传输身份，不能因另一轮失败而将其抹去。但尚未取得与该照片对应的完整诊断 JSON，不能据此核实 `supportProtocol`、RSA/AES 分支、全部写入回调或消息来源，也没有账号登录失败、云服务关闭或手表完成首次设置的证据。0.4.0 的设置请求和状态观察尚待新一轮实表报告。
 
-**最新 18:03 截图**显示另一轮验证：GATT 已连接，当前查询 `1/1` 个 ATT 分片已确认；能力仍在等待，传输身份及首次设置均未开始，错误为未取得可用于身份认证的完整能力。该截图只能确认卡在能力阶段，不能把“写入完成”解释为手表已处理请求，也不能判断是未发通知、只发了无关通知，还是完整消息没有解析出来。旧 UI 在总通知数为 0 时隐藏收包行，因此截图未显示该行值得核对，但不能替代当轮报告中的计数。
+**此前 18:03 截图**显示另一轮验证：GATT 已连接，当前查询 `1/1` 个 ATT 分片已确认；能力仍在等待，传输身份及首次设置均未开始，错误为未取得可用于身份认证的完整能力。该截图只能确认卡在能力阶段，不能把“写入完成”解释为手表已处理请求，也不能判断是未发通知、只发了无关通知，还是完整消息没有解析出来。旧 UI 在总通知数为 0 时隐藏收包行，因此截图未显示该行值得核对，但不能替代当轮报告中的计数。
 
 随后提供的附件实际上仍是 **0.2.0 / build 2 / schema 2**，`generatedAt=2026-11-09T06:11:32Z`，即北京时间 **14:11:32**。它对应前述旧分片错误，不能作为 18:03 这次更新后能力超时的收包证据，也不能用于判断 0.4.1 是否修复。下一轮必须同时核对版本、构建号与生成时间。
 
+### 最新 18:46 的 GATT 连接失败
+
+新附件确认为 **0.4.1 / build 6 / schema 6**，`generatedAt=2026-11-09T10:47:02Z`，即北京时间 **18:47:02**，与本轮截图时间对应。报告提供了此前截图没有的明确系统错误：
+
+| 项目 | 本轮实际观测 |
+| --- | --- |
+| 请求连接 | 北京时间 18:46:11 |
+| 系统失败回调 | 北京时间 18:46:12，`CBErrorDomain`，code `14` |
+| GATT | `result=GATT_CONNECT_FAILED`；`gattConnectionObservedThisAttempt=false`，导出时也未连接 |
+| 服务和标准信息 | 两者均为空，没有进入服务发现与标准读取成功阶段 |
+| 厂商协议 | `status=NOT_ATTEMPTED`；查询排队、提交和确认均为 0；未请求命令／文件通知，没有协议命令写入 |
+
+`CBError.Code.peerRemovedPairingInformation` 表示对端已移除配对信息。该定义是系统错误的含义；这份报告没有记录对端清理的原因，不能进一步断言用户恢复了出厂设置、某次 App 更新清除了密钥，或者云账号拒绝了登录。扫描时能收到广播不等于旧配对信息仍可用于建立连接。
+
+代码对照 `e7c6b7`（0.4.0）与 `bc084eb`（0.4.1）确认，`connectSelected()`、创建 central、`manager.connect(...)`、`didConnect` 与 `didFailToConnect` 的连接路径没有修改。新增查询逻辑在 GATT、服务发现及通知订阅之后运行；本轮查询计数为 0，证明尚未执行到该逻辑。这里可排除“本轮已经发出了新重试查询再导致错误 14”的说法，不能反推出所有硬件状态变化的来源。
+
+可立即由用户操作的恢复路径是：iPhone **设置 → 蓝牙 → 对应 OnePlus Watch 记录右侧 ⓘ → 忽略此设备**，让手表保持配对页面，再回 App 重新扫描、选中并连接。必须确认对应目标，不能批量清除其他设备的配对。若列表没有该记录或仍失败，保留新的报告继续定位。现有 CoreBluetooth 连接方式不能代替系统执行这一步；AccessorySetupKit 对其管理配件的移除属于另一套流程，不能据此认定本 App 能移除任意旧 CoreBluetooth 配对记录。
+
+0.4.2 修复的是失败提示位置、错误解释、结构化报告以及“未开始却显示等待结果”的界面问题。本版保留手动重新连接，不通过自动循环重连、伪造配对成功或发送额外厂商命令处理此错误。能否恢复连接及继续身份／设置，仍以操作后的实表回调为准。
+
 本文不保存设备名后缀、匿名设备标识、照片或完整原始报告。标准设备信息中的字符串也不能单独用于确认内部芯片或固件实现。
 
-### 三种状态必须分开
+### 连接、配对和业务状态必须分开
 
 | 层次 | 目前的证据 | 不能由此推出的结论 |
 | --- | --- | --- |
-| Core Bluetooth / GATT | `didConnect`、服务发现、标准读取和连接保持 | 厂商身份认证或业务绑定完成 |
-| 系统 SMP 配对及密钥保存 | 用户观察到并确认了系统数字弹窗 | 本项目已经独立验证 SMP 完成或 bonding 密钥已持久保存 |
+| Core Bluetooth / GATT | 早前有 `didConnect`、服务发现及标准读取；18:46 这一轮未连接并报错 14 | 把某轮成功覆盖到另一轮，或由连接成功推出业务绑定完成 |
+| 系统 SMP 配对及密钥保存 | 早前用户确认系统数字弹窗；18:46 系统报告对端已移除配对信息 | 本项目已独立验证 bonding 持久保存，或知道哪次操作清除了对端信息 |
 | 厂商传输与身份 | 0.2.0 报告有有效后续分片；早前照片显示版本 5、身份已通过；18:03 的另一轮停在能力阶段 | 将不同轮次合并成一份结果，或仅凭照片确定实际加密分支、完整时序及账号状态 |
 | 首次设置与账号绑定 | 身份通过照片中手表仍处于手动配对；0.4.0 新增开始请求及状态观察，18:03 这一轮尚未启动 | 已激活、账号已绑定，或反过来认定必须登录失败／已无法使用 |
 
@@ -99,7 +121,7 @@ aa 0e 00 00 01 01 08 05 10 14 18 14 20 0a 28 03 2c 16
 
 之前 iOS 版本只发一次能力查询。0.4.1 采用相同已核实请求的重试次数和 2 秒等待，并增加本地完整 ATT 确认门禁：从每次首片实际提交时开始计时，2 秒先到而 ACK 未完整时继续等待，不并发重复写。完整有效能力停止新重试；如果当前查询已经排队或提交，仍等待这一条完整写确认才进入身份。首次查询前已收到有效主动能力时仍执行并确认首发查询，保留其主动来源。
 
-这一调整补齐了可定位的鲁棒性缺口，**不能由此断言最新故障一定由首包丢失引起，也不保证重试可使本固件恢复响应**。本版仍从首次实际提交起最多等待 45 秒，后续重试不延长；保留同一连续解析器及首次归属边界，不能将前置半帧或旧首片重新归为新查询。原厂消息没有 transaction ID，`queryAttempt` 仅标明发送轮次及其 ATT 结果，不能严格对应某一能力回包。
+这一调整补齐了可定位的鲁棒性缺口，**不能由此断言 18:03 的能力等待失败一定由首包丢失引起，也不保证重试可使本固件恢复响应**。本版仍从首次实际提交起最多等待 45 秒，后续重试不延长；保留同一连续解析器及首次归属边界，不能将前置半帧或旧首片重新归为新查询。原厂消息没有 transaction ID，`queryAttempt` 仅标明发送轮次及其 ATT 结果，不能严格对应某一能力回包。
 
 schema 6 的 `vendorProtocol.capabilityQuery` 记录 `status`、`queuedAttempts`、`submittedAttempts`、`acknowledgedAttempts`、`currentAttempt`、`maximumAttempts=4`、`retryDelayMilliseconds=2000`、`hasCapabilities`。轮次从 1 开始；排队、实际首片提交和整条写入确认分别计数。逐命令 `commandWrites.queryAttempt` 关联该轮写入，旧 `requestSubmitted / querySubmittedAt / attWriteAcknowledged / attWriteCallbackObserved / attWriteCompletedAt / attWriteError` 字段继续只表示首次查询，不改成最后一次或所有重试的汇总。
 
@@ -159,11 +181,11 @@ AA | bodyLength | control LE16 | [FSN UInt8] | payload | CRC16
 
 ATT 回调也独立记录：即使协议解析已结束，只要同一有效连接和对应写特征的回调随后到达，仍记录写入确认或错误，不覆盖既有协议结果。旧连接回调不能更新新会话；已导出的报告快照不会被事后改写。
 
-这些修改解决可定位的接收缺陷。针对性回归及执行边界见 [验证方法](VALIDATION.md)。旧 0.2.0 报告无法验证修复后的行为；早前身份通过照片和最新能力阶段失败截图也属于不同连接，仍需各自对应的完整 JSON 核实具体交互。
+这些修改解决可定位的接收缺陷。针对性回归及执行边界见 [验证方法](VALIDATION.md)。旧 0.2.0 报告无法验证修复后的行为；早前身份通过照片、18:03 能力失败截图及 18:46 连接失败报告属于不同连接，仍需各自对应的完整 JSON 核实具体交互。
 
 ## 4. 身份分支的静态依据与实表边界
 
-分支入口为 `ot0.a.D()`：根据实际 `protocolVersion` 选择流程，并读取 `supportProtocol & 3`。不能在未收到应答前假定协议版本，或只凭版本号跳入某个加密分支。0.3.0 已将下列版本 3–5 分支接入 App；早前照片显示这块表的版本为 5、身份已通过，**尚无对应完整 JSON 可核实该轮实际选择的加密能力及详细交互**。最新能力阶段失败的那一轮没有进入此流程。旧版本分支仍未实现。
+分支入口为 `ot0.a.D()`：根据实际 `protocolVersion` 选择流程，并读取 `supportProtocol & 3`。不能在未收到应答前假定协议版本，或只凭版本号跳入某个加密分支。0.3.0 已将下列版本 3–5 分支接入 App；早前照片显示这块表的版本为 5、身份已通过，**尚无对应完整 JSON 可核实该轮实际选择的加密能力及详细交互**。18:03 能力失败与 18:46 GATT 连接失败的两轮都没有进入此流程。旧版本分支仍未实现。
 
 ### 版本 ≥ 3：本地身份检查
 
@@ -244,17 +266,18 @@ ATT 回调也独立记录：即使协议解析已结束，只要同一有效连�
 
 ## 6. 下一步需要的实机证据
 
-下一轮应使用 **0.4.1 build 6**，导出 **schema 6** 的完整 JSON；导出文件名包含 `v0.4.1-b6-` 和时间，需与 `platform` 和 `generatedAt` 一起核对。先记录能力查询及收包情况，只有身份通过后才在同一前台连接中点击“继续首次设置”。优先核对：
+下一轮应使用 **0.4.2 build 7**，导出 **schema 7** 的完整 JSON；导出文件名包含 `v0.4.2-b7-` 和时间，需与 `platform` 和 `generatedAt` 一起核对。先核对系统连接是否恢复；只有 GATT 建立后才检查能力查询，身份通过后才在同一前台连接中点击“继续首次设置”。优先核对：
 
-1. `capabilityQuery` 的排队、实际提交、完整确认次数与 `hasCapabilities`；`commandWrites.queryAttempt` 对应各次写入。核对是否在已有有效能力时停止新重试、是否受写确认或截止时间限制；不能仅从 `1/1` 分片确认认定能力成功。
-2. 命令／文件的通知数和字节数、`decoderDiagnostics`、能力来源与终止错误。区分无命令通知、仅文件通知、空命令通知和已有字节但没有完整能力，不用旧版 30 次通知的数据代替本次结果。
-3. `authentication.selectedCapabilities / capabilitySource / transportAuthenticated`，确认实际版本、能力来源及所需身份步骤；版本 5 不单独决定是否走加密分支。
-4. `businessSessionState / businessEncrypted`，确认认证上下文是否成功移交、实际业务模式及结束原因。
-5. `commandWrites` 中 `serviceID=11` 的 `commandID=7`、`11`，分别检查分片提交、确认及错误；ATT 全部成功不等同手表接受业务语义。
-6. `initialSetup.preQueryObservation` 与 `latestObservation / observations` 的区别，核对 `result / deviceType / oobeFrom / source / encodedFieldNumbers`，以及开始请求和查询的独立写入结果。
-7. 手表实际画面、确认操作和退出等待的时点。状态 0、10...59、未知值、超时或断开各自保留原始含义，不能统一改称“登录失败”；状态 60 也需要与手表可用性共同核验。
+1. `observations.gattFailure` 的阶段、错误域、错误码、标识和发生时间；与 `gattConnectionObservedThisAttempt`、`result` 一起读取。错误 14 的恢复需先处理对应系统配对记录，单次点重连不表示清理完成。
+2. `capabilityQuery` 的排队、实际提交、完整确认次数与 `hasCapabilities`；`commandWrites.queryAttempt` 对应各次写入。核对是否在已有有效能力时停止新重试、是否受写确认或截止时间限制；不能仅从 `1/1` 分片确认认定能力成功。
+3. 命令／文件的通知数和字节数、`decoderDiagnostics`、能力来源与终止错误。区分无命令通知、仅文件通知、空命令通知和已有字节但没有完整能力，不用旧版 30 次通知的数据代替本次结果。
+4. `authentication.selectedCapabilities / capabilitySource / transportAuthenticated`，确认实际版本、能力来源及所需身份步骤；版本 5 不单独决定是否走加密分支。
+5. `businessSessionState / businessEncrypted`，确认认证上下文是否成功移交、实际业务模式及结束原因。
+6. `commandWrites` 中 `serviceID=11` 的 `commandID=7`、`11`，分别检查分片提交、确认及错误；ATT 全部成功不等同手表接受业务语义。
+7. `initialSetup.preQueryObservation` 与 `latestObservation / observations` 的区别，核对 `result / deviceType / oobeFrom / source / encodedFieldNumbers`，以及开始请求和查询的独立写入结果。
+8. 手表实际画面、确认操作和退出等待的时点。状态 0、10...59、未知值、超时或断开各自保留原始含义，不能统一改称“登录失败”；状态 60 也需要与手表可用性共同核验。
 
-除版本、构建和生成时间外，上述协议字段均位于 `vendorProtocol`。早前照片支持继续推进身份后的业务验证，而最新截图要求先恢复本轮能力与身份；两者都尚不能给出完整离线使用或云端阻断的结论。若本版之后仍卡住，应先根据新报告确定实际阶段，再调查该阶段的写入、接收、账号、设备信息或同步缺口，不能用伪造完成标记跳过证据。
+系统连接错误位于 `observations`，能力、身份和设置字段位于 `vendorProtocol`。早前照片支持继续推进身份后的业务验证，最新报告则要求先处理本轮系统配对错误并恢复 GATT；这些观测都尚不能给出完整离线使用或云端阻断的结论。若本版之后仍卡住，应先根据新报告确定实际阶段，再调查该阶段的写入、接收、账号、设备信息或同步缺口，不能用伪造完成标记跳过证据。
 
 ## 7. 可追溯来源
 
@@ -276,3 +299,8 @@ ATT 回调也独立记录：即使协议解析已结束，只要同一有效连�
 - `CBPeripheral.state` 的连接状态语义：<https://developer.apple.com/documentation/corebluetooth/cbperipheral/state>
 - Central manager delegate 的连接、发现与断开回调：<https://developer.apple.com/documentation/corebluetooth/cbcentralmanagerdelegate>
 - Bluetooth 安全、配对及 bonding 概念：<https://support.apple.com/en-ie/guide/security/sec82597d97e/web>
+- 对端配对信息移除错误：<https://developer.apple.com/documentation/corebluetooth/cberror-swift.struct/code/peerremovedpairinginformation>
+- 系统取消配对的“忽略此设备”入口：<https://support.apple.com/zh-cn/105108>
+- 已连接配件的取消配对／重新配对排查步骤：<https://support.apple.com/en-au/111804>
+- CoreBluetooth 的取消连接接口：<https://developer.apple.com/documentation/corebluetooth/cbcentralmanager/cancelperipheralconnection%28_%3A%29>
+- AccessorySetupKit 管理与移除配件的范围：<https://developer.apple.com/videos/play/wwdc2024/10203/>

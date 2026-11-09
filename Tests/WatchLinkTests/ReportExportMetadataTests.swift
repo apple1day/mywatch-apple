@@ -17,7 +17,7 @@ final class ReportExportMetadataTests: XCTestCase {
         XCTAssertEqual(metadata.versionSummary, "报告版本：0.2.0 · 构建 2 · schema 2")
         XCTAssertEqual(metadata.generatedAtSummary, "生成于 2026-11-09 14:11:32（UTC+08:00）")
         XCTAssertEqual(metadata.suggestedFilename, "WatchLink-iOS-v0.2.0-b2-20261109-141132-12345678")
-        XCTAssertFalse(metadata.suggestedFilename.contains("0.4.1"))
+        XCTAssertFalse(metadata.suggestedFilename.contains("0.4.2"))
     }
 
     func testFilenameRemainsStableForOneSnapshotAndDistinctAcrossSameSecondExports() throws {
@@ -28,7 +28,7 @@ final class ReportExportMetadataTests: XCTestCase {
         let second = ReportExportMetadata(snapshot: report, exportID: anotherID, timeZone: utc)
         XCTAssertEqual(first.suggestedFilename, same.suggestedFilename)
         XCTAssertNotEqual(first.suggestedFilename, second.suggestedFilename)
-        XCTAssertEqual(first.suggestedFilename, "WatchLink-iOS-v0.4.1-b6-20261109-101500-12345678")
+        XCTAssertEqual(first.suggestedFilename, "WatchLink-iOS-v0.4.2-b7-20261109-101500-12345678")
     }
 
     func testMalformedOrMissingMetadataNeverInventsCurrentAppOrTime() throws {
@@ -51,19 +51,19 @@ final class ReportExportMetadataTests: XCTestCase {
 
     func testValidMetadataFieldsSurviveOtherMissingOrInvalidMetadata() throws {
         let report = try JSONSerialization.data(withJSONObject: [
-            "platform": ["appVersion": "0.4.1"],
-            "schemaVersion": 6, "generatedAt": "not-a-date"
+            "platform": ["appVersion": "0.4.2"],
+            "schemaVersion": 7, "generatedAt": "not-a-date"
         ])
         let metadata = ReportExportMetadata(snapshot: report, exportID: exportID, timeZone: utc)
-        XCTAssertEqual(metadata.appVersion, "0.4.1")
+        XCTAssertEqual(metadata.appVersion, "0.4.2")
         XCTAssertNil(metadata.appBuild)
-        XCTAssertEqual(metadata.schemaVersion, 6)
+        XCTAssertEqual(metadata.schemaVersion, 7)
         XCTAssertNil(metadata.generatedAt)
-        XCTAssertEqual(metadata.suggestedFilename, "WatchLink-iOS-v0.4.1-bunknown-date-unknown-12345678")
+        XCTAssertEqual(metadata.suggestedFilename, "WatchLink-iOS-v0.4.2-bunknown-date-unknown-12345678")
     }
 
     func testFilenameRejectsUnsafeOrUnboundedVersionComponents() throws {
-        for invalid in ["../device", "..", "0.4.1\n", "private device", "手表", String(repeating: "1", count: 40)] {
+        for invalid in ["../device", "..", "0.4.2\n", "private device", "手表", String(repeating: "1", count: 40)] {
             let report = try data(version: invalid, build: invalid)
             let metadata = ReportExportMetadata(snapshot: report, exportID: exportID, timeZone: utc)
             XCTAssertNil(metadata.appVersion)
@@ -73,10 +73,10 @@ final class ReportExportMetadataTests: XCTestCase {
                 CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-").contains($0)
             })
         }
-        let valid = ReportExportMetadata(snapshot: try data(version: "0.4.1-beta.2", build: "6"),
+        let valid = ReportExportMetadata(snapshot: try data(version: "0.4.2-beta.2", build: "7"),
                                          exportID: exportID, timeZone: utc)
-        XCTAssertEqual(valid.appVersion, "0.4.1-beta.2")
-        XCTAssertEqual(valid.appBuild, "6")
+        XCTAssertEqual(valid.appVersion, "0.4.2-beta.2")
+        XCTAssertEqual(valid.appBuild, "7")
     }
 
     func testExplicitOffsetAndFractionalSecondsDescribeSameInstantInChosenZone() throws {
@@ -103,7 +103,7 @@ final class ReportExportMetadataTests: XCTestCase {
         XCTAssertEqual(first.generatedAtSummary, second.generatedAtSummary)
     }
 
-    private func data(version: String = "0.4.1", build: String = "6", schema: Int = 6,
+    private func data(version: String = "0.4.2", build: String = "7", schema: Int = 7,
                       generatedAt: String = "2026-11-09T10:15:00Z") throws -> Data {
         try JSONSerialization.data(withJSONObject: [
             "platform": ["appVersion": version, "appBuild": build],

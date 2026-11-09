@@ -232,6 +232,21 @@ struct VendorProbeSnapshot: Codable, Equatable {
         }
     }
 
+    /// Progress describes work actually started. A selected peripheral or an
+    /// unsuccessful GATT attempt must not imply that a capability reply is due.
+    var capabilityProgressLabel: String {
+        if capabilities != nil || authentication.selectedCapabilities != nil
+            || decoderDiagnostics.unsolicitedCapabilities != nil { return "已取得" }
+        switch status {
+        case "NOT_ATTEMPTED": return "尚未开始"
+        case "SUBSCRIBING": return "正在开启通知"
+        case "WAITING_FOR_RESPONSE", "CAPABILITIES_WAITING_FOR_WRITE": return "等待结果"
+        case "FAILED": return "未取得"
+        case "INTERRUPTED": return "已中断"
+        default: return requestSubmitted ? "未取得" : "尚未开始"
+        }
+    }
+
     var summary: String {
         switch status {
         case "SUBSCRIBING": return "正在开启手表消息通道 · 请完成系统配对提示"

@@ -47,6 +47,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     @Published private(set) var serviceRows: [ServiceRow] = []
     @Published private(set) var readings: [StandardReading] = []
     @Published private(set) var events: [ProbeEvent] = []
+    @Published private(set) var gattFailure: GATTConnectionFailure?
     @Published private(set) var isCheckingVendorProtocol = false
     @Published private(set) var isSettingUp = false
     @Published private(set) var vendorProtocol = VendorProbeSnapshot()
@@ -703,14 +704,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     /// Call before showing the share sheet to preserve the current connection state.
     func makeReport() -> Data {
         let report = ProbeReport(
-            schemaVersion: 6,
+            schemaVersion: 7,
             generatedAt: Date(),
             platform: PlatformSnapshot(
                 system: UIDevice.current.systemName,
                 systemVersion: UIDevice.current.systemVersion,
                 deviceType: UIDevice.current.model,
-                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.1",
-                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "6"
+                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.2",
+                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "7"
             ),
             capabilities: CapabilitySnapshot(),
             selectedDevice: selectedDevice.map { DeviceSnapshot(device: $0, salt: sessionSalt) },
@@ -718,7 +719,8 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                 stateText: stateText, bluetoothState: bluetoothText,
                 scanningAtExport: phase == .scanning, connectingAtExport: phase == .connecting,
                 gattConnectedAtExport: isConnected,
-                gattConnectionObservedThisAttempt: gattObserved, result: result
+                gattConnectionObservedThisAttempt: gattObserved, result: result,
+                gattFailure: gattFailure
             ),
             services: serviceRows,
             standardReadings: readings,
@@ -826,6 +828,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         readings = []
         events = []
         gattObserved = false
+        gattFailure = nil
         result = "NOT_ATTEMPTED"
         vendorProtocol = VendorProbeSnapshot()
     }
@@ -969,11 +972,15 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     func centralManager(_ manager: CBCentralManager, didFailToConnect device: CBPeripheral, error: Error?) {
         guard manager === central, device === peripheral else { return }
-        fail("GATT 未能连接\(errorSuffix(error))", result: "GATT_CONNECT_FAILED")
+        let failure = GATTConnectionFailure(stage: .connect, error: error)
+        gattFailure = failure
+        fail("\(failure.title)\(errorSuffix(error))", result: "GATT_CONNECT_FAILED")
     }
 
     func centralManager(_ manager: CBCentralManager, didDisconnectPeripheral device: CBPeripheral, error: Error?) {
         guard manager === central, device === peripheral else { return }
+        let failure = GATTConnectionFailure(stage: .disconnection, error: error)
+        gattFailure = failure
         if isVendorSessionLive {
             let detail = error as NSError?
             vendorProtocol.error = .init(phase: "LINK_DISCONNECTED",
@@ -981,7 +988,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                                          code: detail?.code ?? 1005,
                                          message: "连接验证或首次设置期间 GATT 连接断开。")
         }
-        fail("GATT 连接已断开\(errorSuffix(error)) · 观测已保留", result: "GATT_DISCONNECTED")
+        fail("\(failure.title)\(errorSuffix(error)) · 观测已保留", result: "GATT_DISCONNECTED")
     }
 
     private func current(_ device: CBPeripheral, token: Int) -> Bool {

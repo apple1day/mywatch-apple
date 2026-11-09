@@ -20,6 +20,15 @@ final class HomeUITests: XCTestCase {
         screenshot.name = "WatchLink-iPhone-home"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+
+        // Recovery instructions must be reachable without a successful BLE
+        // connection, including when the system rejects the initial attempt.
+        app.buttons["guideButton"].tap()
+        XCTAssertTrue(app.staticTexts["pairingRecoveryGuide"].waitForExistence(timeout: 5))
+        let recoveryScreenshot = XCTAttachment(screenshot: app.screenshot())
+        recoveryScreenshot.name = "WatchLink-system-pairing-recovery-guide"
+        recoveryScreenshot.lifetime = .keepAlways
+        add(recoveryScreenshot)
     }
 
     func testFirstReportContainsSnapshotAndExplicitUnsupportedStages() throws {
@@ -56,17 +65,17 @@ final class HomeUITests: XCTestCase {
         // Native preview must expose a complete JSON snapshot, not an excerpt.
         let reportData = try XCTUnwrap(reportText.data(using: .utf8))
         let report = try XCTUnwrap(JSONSerialization.jsonObject(with: reportData) as? [String: Any])
-        XCTAssertEqual(report["schemaVersion"] as? Int, 6)
+        XCTAssertEqual(report["schemaVersion"] as? Int, 7)
         let platform = try XCTUnwrap(report["platform"] as? [String: Any])
         let appVersion = try XCTUnwrap(platform["appVersion"] as? String)
         let appBuild = try XCTUnwrap(platform["appBuild"] as? String)
-        XCTAssertEqual(appVersion, "0.4.1")
-        XCTAssertEqual(appBuild, "6")
+        XCTAssertEqual(appVersion, "0.4.2")
+        XCTAssertEqual(appBuild, "7")
         // The visible export identity must describe these exact snapshot bytes.
         // It must not relabel an older report with the running app's version.
         let versionMetadata = app.staticTexts["reportVersionMetadata"]
         XCTAssertTrue(versionMetadata.exists)
-        XCTAssertEqual(versionMetadata.label, "报告版本：\(appVersion) · 构建 \(appBuild) · schema 6")
+        XCTAssertEqual(versionMetadata.label, "报告版本：\(appVersion) · 构建 \(appBuild) · schema 7")
         let generatedAt = try XCTUnwrap(report["generatedAt"] as? String)
         let date = try XCTUnwrap(ISO8601DateFormatter().date(from: generatedAt))
         let dateFormatter = DateFormatter()

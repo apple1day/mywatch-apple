@@ -44,8 +44,8 @@ final class ModelsTests: XCTestCase {
         let identifier = UUID(uuidString: "12345678-1234-5678-1234-567812345678")!
         let device = DiscoveredDevice(id: identifier, name: "OnePlus Watch A1B2", rssi: -45,
                                       isCandidate: true, advertisedServices: ["180F"], isConnectable: true)
-        let report = ProbeReport(schemaVersion: 6, generatedAt: Date(timeIntervalSince1970: 0),
-                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.4.1", appBuild: "6"),
+        let report = ProbeReport(schemaVersion: 7, generatedAt: Date(timeIntervalSince1970: 0),
+                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.4.2", appBuild: "7"),
                                  capabilities: CapabilitySnapshot(), selectedDevice: DeviceSnapshot(device: device, salt: "session"),
                                  observations: ObservationSnapshot(stateText: "GATT 检测完成", bluetoothState: "蓝牙已开启", scanningAtExport: false, connectingAtExport: false,
                                                                    gattConnectedAtExport: true, gattConnectionObservedThisAttempt: true, result: "GATT_DIAGNOSTICS_COMPLETE"),
@@ -62,6 +62,19 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(capabilities["healthSync"] as? String, WatchProfile.notImplemented)
         let observation = try XCTUnwrap(object["observations"] as? [String: Any])
         XCTAssertEqual(observation["gattConnectedAtExport"] as? Bool, true)
+    }
+
+    func testObservationReportsDecodeWithoutTheNewSystemFailureField() throws {
+        let previous = Data("""
+        {"stateText":"GATT 未能连接","bluetoothState":"蓝牙已开启",
+         "scanningAtExport":false,"connectingAtExport":false,
+         "gattConnectedAtExport":false,"gattConnectionObservedThisAttempt":false,
+         "result":"GATT_CONNECT_FAILED"}
+        """.utf8)
+        let observation = try JSONDecoder().decode(ObservationSnapshot.self, from: previous)
+        XCTAssertNil(observation.gattFailure)
+        XCTAssertFalse(observation.gattConnectionObservedThisAttempt)
+        XCTAssertEqual(observation.result, "GATT_CONNECT_FAILED")
     }
 
     func testNamesAndStandardTextAreBoundedWithoutControlCharacters() {
