@@ -46,6 +46,8 @@ final class HomeUITests: XCTestCase {
         XCTAssertTrue(preview.label.contains("schemaVersion"))
         XCTAssertTrue(preview.label.contains("UNAVAILABLE_VIA_PUBLIC_IOS_API"))
         XCTAssertTrue(preview.label.contains("NOT_IMPLEMENTED"))
+        XCTAssertTrue(preview.label.contains("TRANSPORT_CAPABILITY_QUERY_ONLY"))
+        XCTAssertTrue(preview.label.contains("NOT_OBSERVABLE_VIA_PUBLIC_CORE_BLUETOOTH_API"))
 
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "WatchLink-first-report-snapshot"

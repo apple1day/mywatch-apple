@@ -24,6 +24,14 @@ private final class PeripheralDelegate: NSObject, CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         owner?.receivedValue(peripheral, characteristic: characteristic, error: error, token: token)
     }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        owner?.receivedNotificationState(peripheral, characteristic: characteristic, error: error, token: token)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        owner?.receivedWriteAcknowledgement(peripheral, characteristic: characteristic, error: error, token: token)
+    }
 }
 
 /// Foreground-only Core Bluetooth diagnostic controller. All delegates use the main queue.
@@ -39,9 +47,11 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     @Published private(set) var serviceRows: [ServiceRow] = []
     @Published private(set) var readings: [StandardReading] = []
     @Published private(set) var events: [ProbeEvent] = []
+    @Published private(set) var isCheckingVendorProtocol = false
+    @Published private(set) var vendorProtocol = VendorProbeSnapshot()
 
     private enum PendingAction { case scan, connect(UUID) }
-    private enum Phase { case idle, waiting, scanning, connecting, services, characteristics, reading, ready }
+    private enum Phase { case idle, waiting, scanning, connecting, services, characteristics, reading, ready, vendor }
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
     private var peripheralDelegate: PeripheralDelegate?
@@ -59,6 +69,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     private var result = "NOT_ATTEMPTED"
     private let sessionSalt = UUID().uuidString
     private var deviceLimitReported = false
+    private var vendorCharacteristics: [CBCharacteristic] = []
+    private var vendorTransport: VendorGATTTransport?
+    private var vendorDecoder = OppoTransportDecoder()
 
     var selectedDevice: DiscoveredDevice? {
         devices.first { $0.id == selectedDeviceID }
@@ -71,6 +84,75 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     var canExportReport: Bool { selectedDeviceID != nil || !events.isEmpty }
+
+    var canCheckVendorProtocol: Bool {
+        isConnected && phase == .ready && vendorProtocol.profileAvailable
+            && vendorProtocol.status == "NOT_ATTEMPTED"
+    }
+
+    /// One capability query per GATT connection. A fresh connection is required to
+    /// retry, so a delayed ATT callback can never acknowledge a subsequent attempt.
+    func checkVendorProtocol() {
+        guard canCheckVendorProtocol, let peripheral,
+              let write = vendorCharacteristic(service: OppoGATTProfile.commandService,
+                                                uuid: OppoGATTProfile.commandWrite),
+              let notify = vendorCharacteristic(service: OppoGATTProfile.commandService,
+                                                 uuid: OppoGATTProfile.commandNotify) else { return }
+        let fileNotify = vendorCharacteristic(service: OppoGATTProfile.fileService,
+                                               uuid: OppoGATTProfile.fileNotify)
+        let token = generation
+        vendorDecoder.reset()
+        vendorProtocol.status = "SUBSCRIBING"
+        vendorProtocol.startedAt = Date()
+        isCheckingVendorProtocol = true
+        phase = .vendor
+        result = "VENDOR_PROTOCOL_SUBSCRIBING"
+        stateText = vendorProtocol.summary
+        addEvent("开始手表传输能力检查：先开启已核实的通知通道，再发送一次能力查询。系统配对状态无法由此直接读取。")
+
+        let transport = VendorGATTTransport(
+            peripheral: peripheral, commandWrite: write, commandNotify: notify, fileNotify: fileNotify,
+            onReady: { [weak self] in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol,
+                      let transport = self.vendorTransport else { return }
+                self.recordVendorNotifications()
+                self.vendorProtocol.status = "WAITING_FOR_RESPONSE"
+                self.vendorProtocol.requestSubmitted = true
+                self.result = "VENDOR_PROTOCOL_WAITING_FOR_RESPONSE"
+                self.stateText = self.vendorProtocol.summary
+                self.addEvent("通知通道已开启，提交 TransportConsult 能力查询（服务 1 / 命令 1）。此消息不包含验证码、账号或绑定成功标记。")
+                self.setTimer(seconds: 45) { [weak self] in
+                    guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                    self.vendorProbeFailed(.init(phase: "PROTOCOL_RESPONSE", domain: "WatchLink.ProtocolProbe",
+                                                 code: 1001, message: self.vendorDecoder.hasPendingData
+                                                    ? "等待手表完整协议回应超时；仅收到不完整帧。"
+                                                    : "能力查询后未收到可验证的协议回应。"))
+                }
+                if !transport.send(fragments: [OppoProtocol.transportConsultRequest]) {
+                    self.vendorProtocol.requestSubmitted = false
+                    if self.isCheckingVendorProtocol {
+                        self.vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                                     code: 1002, message: "查询没有进入发送队列。"))
+                    }
+                }
+            },
+            onReceived: { [weak self] channel, data in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                self.receiveVendorData(channel, data: data)
+            },
+            onWriteComplete: { [weak self] in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                self.vendorProtocol.attWriteAcknowledged = true
+                self.addEvent("能力查询已获得 ATT 写入确认，继续等待手表协议回应；写入确认不是绑定确认。")
+            },
+            onFailure: { [weak self] error in
+                guard let self, self.generation == token, self.isCheckingVendorProtocol else { return }
+                self.vendorProbeFailed(error)
+            }
+        )
+        vendorTransport = transport
+        transport.start()
+    }
 
     func startScan() {
         retireRadio()
@@ -134,14 +216,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     /// Call before showing the share sheet to preserve the current connection state.
     func makeReport() -> Data {
         let report = ProbeReport(
-            schemaVersion: 1,
+            schemaVersion: 2,
             generatedAt: Date(),
             platform: PlatformSnapshot(
                 system: UIDevice.current.systemName,
                 systemVersion: UIDevice.current.systemVersion,
                 deviceType: UIDevice.current.model,
-                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0",
-                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0",
+                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "2"
             ),
             capabilities: CapabilitySnapshot(),
             selectedDevice: selectedDevice.map { DeviceSnapshot(device: $0, salt: sessionSalt) },
@@ -154,7 +236,8 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             services: serviceRows,
             standardReadings: readings,
             events: events,
-            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷或私有特征值。设备名和标准设备信息仍可能识别你的设备。"
+            privacy: "设备标识为本次启动加盐摘要；不包含完整 Core Bluetooth 设备 UUID、MAC 地址、原始广播载荷、验证码、密钥或原始私有载荷。仅记录已校验的传输能力字段及有界错误信息。设备名和标准设备信息仍可能识别你的设备。",
+            vendorProtocol: vendorProtocol
         )
         return report.encoded()
     }
@@ -181,6 +264,13 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func retireRadio() {
+        recordVendorNotifications()
+        if isCheckingVendorProtocol { vendorProtocol.status = "INTERRUPTED" }
+        isCheckingVendorProtocol = false
+        vendorTransport?.cancel()
+        vendorTransport = nil
+        vendorDecoder.reset()
+        vendorCharacteristics = []
         generation += 1
         cancelTimer()
         pendingAction = nil
@@ -211,6 +301,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         events = []
         gattObserved = false
         result = "NOT_ATTEMPTED"
+        vendorProtocol = VendorProbeSnapshot()
     }
 
     private func addEvent(_ text: String) {
@@ -245,7 +336,8 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     private func errorSuffix(_ error: Error?) -> String {
         guard let error else { return "" }
-        return "（系统错误码 \((error as NSError).code)）"
+        let detail = error as NSError
+        return "（\(WatchProfile.safeText(detail.domain, limit: 120))，错误码 \(detail.code)）"
     }
 
     func centralManagerDidUpdateState(_ manager: CBCentralManager) {
@@ -356,6 +448,13 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     func centralManager(_ manager: CBCentralManager, didDisconnectPeripheral device: CBPeripheral, error: Error?) {
         guard manager === central, device === peripheral else { return }
+        if isCheckingVendorProtocol {
+            let detail = error as NSError?
+            vendorProtocol.error = .init(phase: "LINK_DISCONNECTED",
+                                         domain: detail?.domain ?? "WatchLink.ProtocolProbe",
+                                         code: detail?.code ?? 1005,
+                                         message: "协议检查期间 GATT 连接断开。")
+        }
         fail("GATT 连接已断开\(errorSuffix(error)) · 观测已保留", result: "GATT_DISCONNECTED")
     }
 
@@ -415,6 +514,11 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             let uuid = WatchProfile.normalizeUUID(characteristic.uuid.uuidString)
             serviceRows.append(ServiceRow(id: "characteristic-\(serviceRows.count)", serviceUUID: serviceUUID,
                                           characteristicUUID: uuid, properties: Self.propertyLabels(characteristic.properties)))
+            if (serviceUUID == OppoGATTProfile.commandService &&
+                [OppoGATTProfile.commandWrite, OppoGATTProfile.commandNotify].contains(uuid)) ||
+                (serviceUUID == OppoGATTProfile.fileService && uuid == OppoGATTProfile.fileNotify) {
+                vendorCharacteristics.append(characteristic)
+            }
             if characteristic.properties.contains(.read),
                WatchProfile.canReadStandard(characteristic: uuid, service: serviceUUID),
                queuedReadUUIDs.insert(uuid).inserted {
@@ -430,9 +534,17 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             phase = .ready
             expectedRead = nil
             cancelTimer()
-            result = "GATT_DIAGNOSTICS_COMPLETE"
-            stateText = "GATT 检测完成 · 一代主连接仍未适配"
+            vendorProtocol.profileAvailable = OppoGATTProfile.isAvailable(in: serviceRows)
+            vendorProtocol.profileDiscoveryCompleted = true
+            result = readings.contains(where: { $0.status == "READ_ERROR" })
+                ? "GATT_DIAGNOSTICS_PARTIAL" : "GATT_DIAGNOSTICS_COMPLETE"
+            stateText = vendorProtocol.profileAvailable
+                ? "GATT 检测完成 · 可继续检查手表协议"
+                : "GATT 检测完成 · 未发现完整的手表协议通道"
             addEvent(readings.isEmpty ? "未发现可读取的标准电量／设备信息字段。没有标准字段不能单独证明不兼容。" : "已完成标准字段读取；没有执行私有认证、绑定或控制写入。")
+            if vendorProtocol.profileAvailable {
+                addEvent("发现已核实 UUID 的命令写入与通知特征。可主动执行一次协议能力查询；特征存在不代表业务绑定已实现。")
+            }
             return
         }
         let characteristic = pendingReads.removeFirst()
@@ -448,7 +560,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
 
     fileprivate func receivedValue(_ device: CBPeripheral, characteristic: CBCharacteristic,
                                   error: Error?, token: Int) {
-        guard current(device, token: token), phase == .reading, characteristic === expectedRead else { return }
+        guard current(device, token: token) else { return }
+        vendorTransport?.valueUpdated(device, characteristic: characteristic, error: error)
+        guard phase == .reading, characteristic === expectedRead else { return }
         cancelTimer()
         expectedRead = nil
         let uuid = WatchProfile.normalizeUUID(characteristic.uuid.uuidString)
@@ -457,6 +571,83 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             : (value: "读取失败\(errorSuffix(error))", status: "READ_ERROR")
         readings.append(StandardReading(uuid: uuid, label: label, value: parsed.value, status: parsed.status))
         readNextValue()
+    }
+
+    fileprivate func receivedNotificationState(_ device: CBPeripheral, characteristic: CBCharacteristic,
+                                              error: Error?, token: Int) {
+        guard current(device, token: token) else { return }
+        vendorTransport?.notificationStateChanged(device, characteristic: characteristic, error: error)
+        recordVendorNotifications()
+    }
+
+    fileprivate func receivedWriteAcknowledgement(_ device: CBPeripheral, characteristic: CBCharacteristic,
+                                                 error: Error?, token: Int) {
+        guard current(device, token: token) else { return }
+        vendorTransport?.writeCompleted(device, characteristic: characteristic, error: error)
+    }
+
+    private func vendorCharacteristic(service: String, uuid: String) -> CBCharacteristic? {
+        let matches = vendorCharacteristics.filter {
+            $0.service.map { WatchProfile.normalizeUUID($0.uuid.uuidString) == service } == true
+                && WatchProfile.normalizeUUID($0.uuid.uuidString) == uuid
+        }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    private func recordVendorNotifications() {
+        guard let transport = vendorTransport else { return }
+        vendorProtocol.commandNotificationsEnabled = transport.commandNotificationsEnabled
+        vendorProtocol.fileNotificationsEnabled = transport.fileNotificationsEnabled
+    }
+
+    private func receiveVendorData(_ channel: VendorGATTTransport.Channel, data: Data) {
+        guard vendorProtocol.notificationCount < 64,
+              data.count <= 64 * 1024 - vendorProtocol.receivedByteCount else {
+            vendorProbeFailed(.init(phase: "PROTOCOL_RECEIVE", domain: "WatchLink.ProtocolProbe",
+                                    code: 1003, message: "本次协议检查已达到接收数量或长度上限。"))
+            return
+        }
+        vendorProtocol.notificationCount += 1
+        vendorProtocol.receivedByteCount += data.count
+        if !vendorProtocol.requestSubmitted { vendorProtocol.preQueryNotificationCount += 1 }
+        // File data is counted, but never interpreted, persisted, or acknowledged as
+        // a command response. No file transfer is requested by this application.
+        guard channel == .command, vendorProtocol.requestSubmitted else { return }
+        for event in vendorDecoder.append(data) {
+            switch event {
+            case .capabilities(let capabilities):
+                vendorProtocol.capabilities = capabilities
+                vendorProtocol.responseAt = Date()
+                vendorProtocol.status = "CAPABILITIES_RECEIVED_AUTH_PENDING"
+                recordVendorNotifications()
+                cancelTimer()
+                isCheckingVendorProtocol = false
+                phase = .ready
+                result = "VENDOR_CAPABILITIES_RECEIVED_AUTH_PENDING"
+                stateText = vendorProtocol.summary
+                addEvent("收到通过帧与校验验证的手表能力回应：协议版本 \(capabilities.protocolVersion)，帧长 \(capabilities.maxFrameSize)，传输单元 \(capabilities.maxTransmissionUnit)。尚未执行后续身份认证与业务绑定。")
+                vendorTransport?.cancel()
+                return
+            case .rejected(let error):
+                vendorProbeFailed(.init(phase: "PROTOCOL_DECODE", domain: "WatchLink.OppoProtocol",
+                                        code: 1004, message: "协商回应未通过验证：\(error.diagnosticMessage)"))
+                return
+            }
+        }
+    }
+
+    private func vendorProbeFailed(_ error: VendorGATTTransport.Failure) {
+        recordVendorNotifications()
+        vendorProtocol.status = "FAILED"
+        vendorProtocol.error = error
+        isCheckingVendorProtocol = false
+        cancelTimer()
+        vendorTransport?.cancel()
+        vendorDecoder.reset()
+        phase = isConnected ? .ready : .idle
+        result = "VENDOR_PROTOCOL_QUERY_FAILED"
+        stateText = vendorProtocol.summary
+        addEvent("手表协议检查停止：\(error.description)。请导出报告；重新检查前先断开并重连。")
     }
 
     private static func propertyLabels(_ properties: CBCharacteristicProperties) -> [String] {

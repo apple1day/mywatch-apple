@@ -28,7 +28,7 @@ jobs:
         with:
           name: WatchLink-iOS-device-build
           path: |
-            dist/WatchLink-iOS-unsigned-0.1.0.zip
+            dist/WatchLink-iOS-unsigned-0.2.0.zip
             dist/BUILD-ARTIFACTS.txt
             dist/SHA256SUMS.txt
           retention-days: 14
@@ -39,7 +39,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: WatchLink-iOS-simulator-build
-          path: dist/WatchLink-iOS-simulator-0.1.0.zip
+          path: dist/WatchLink-iOS-simulator-0.2.0.zip
           retention-days: 14
       - name: Export simulator screenshots
         if: always()

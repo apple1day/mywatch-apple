@@ -12,7 +12,7 @@
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSRequiresIPhoneOS</key><true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>用于发现附近的手表、检查可用的蓝牙服务并读取标准设备信息。当前版本不能完成原厂绑定或健康同步。</string>
+    <string>用于发现附近的手表、读取标准设备信息，并在你启动协议检查后查询手表的传输能力。当前版本不能完成原厂绑定或健康同步。</string>
     <key>UIApplicationSceneManifest</key><dict>
         <key>UIApplicationSupportsMultipleScenes</key><false/>
     </dict>

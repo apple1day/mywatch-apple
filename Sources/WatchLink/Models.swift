@@ -150,7 +150,7 @@ struct CapabilitySnapshot: Codable, Equatable {
     let dataRFCOMMUUID: String
 
     init() {
-        gatt = "CORE_BLUETOOTH_DIAGNOSTICS_ONLY"
+        gatt = "CORE_BLUETOOTH_DIAGNOSTICS_AND_TRANSPORT_CAPABILITY_QUERY"
         classicRFCOMM = WatchProfile.classicUnavailable
         vendorAuthentication = WatchProfile.notImplemented
         accountBinding = WatchProfile.notImplemented
@@ -182,6 +182,7 @@ struct ProbeReport: Codable, Equatable {
     let standardReadings: [StandardReading]
     let events: [ProbeEvent]
     let privacy: String
+    var vendorProtocol: VendorProbeSnapshot? = nil
 
     func encoded() -> Data {
         let encoder = JSONEncoder()

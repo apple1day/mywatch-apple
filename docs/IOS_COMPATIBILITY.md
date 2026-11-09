@@ -15,6 +15,14 @@ Android 项目 [apple1day/mywatch](https://github.com/apple1day/mywatch/blob/3c6
 
 这些 UUID 是 RFCOMM 服务标识。本 iOS App 不把它们传给 GATT 服务发现并据此声称移植成功。
 
+## 2026-11-09 的实表新增证据
+
+用户通过 0.1.0 提供了保持连接的 GATT 报告：7 个服务、14 个特征，其中存在 `00002760-08C2-11E1-9073-0E8AC72E1011` 下的 `…0011 / …0012 / …0013`，以及 `…1012` 下的 `…0014 / …0015`。这些实际服务使 BLE 协议路径值得验证；之前 Android 一代分支使用 RFCOMM 的结论，不能推出设备没有另一条 BLE 业务路径。
+
+原厂 APK 的 `it0.e` 确认：手机向 `1011/0011` 写命令，订阅 `1011/0012`；文件服务存在时再订阅 `1012/0015`。本版没有使用缺少 APK 用法证据的 `0013`，也不把其他芯片示例 UUID 当作验证码确认通道。
+
+0.2.0 实现上述订阅与一条传输能力查询，详细证据见 [绑定问题分析](BINDING_ANALYSIS.md)。现有报告未包含原厂业务回应，无法证明本地认证或业务绑定已经完成。
+
 ## Apple 公开接口的范围
 
 ### CoreBluetooth
@@ -41,16 +49,18 @@ Apple 的 [WWDC19：What’s New in Core Bluetooth](https://developer.apple.com/
 
 1. BLE 扫描产生名称候选，不能据此认证型号或所有权。
 2. CoreBluetooth 连接成功仅记为 GATT 连接成功。
-3. 发现的服务、特征和标准值来自设备回包；不发送自定义认证、控制、升级或账号指令。
+3. 发现的服务、特征和标准值来自设备回包；用户主动点击协议检查后，额外订阅已核实的通知并发送一次已还原的传输能力查询。
 4. 原厂绑定、通知和健康同步单独标记为未实现。
 5. RFCOMM 状态记为普通 iOS 公共 API 无直接对应实现，而非“已连接”或“手表不支持”。
+6. 一次 ATT 写确认与有效协议能力回应分开记录；两者都不升级为身份认证、系统持久配对或账号绑定成功。
+7. 系统验证码不由应用自行重发。Apple 的[配对说明](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/BestPracticesForSettingUpYourIOSDeviceAsAPeripheral/BestPracticesForSettingUpYourIOSDeviceAsAPeripheral.html)和 [DTS 解释](https://developer.apple.com/forums/thread/759435)区分了加密连接／bonding 与应用业务；当前 App 无法直接查询系统 bond 状态。
 
 iOS 的 CBPeripheral identifier 不是蓝牙 MAC。本项目仅为内部选择保存 UUID，导出时使用每次会话独立的匿名标识；不会把它描述成“读取 MAC 后脱敏”。
 
 ## 需要什么证据才能继续
 
-- 用户实体手表是否存在 iPhone 能发现的 BLE 广播或可访问 GATT 服务。
-- 标准及私有服务 UUID、特征属性、实际连接阶段和退出原因。
-- 如另有 GATT 业务通路，需要其真实消息协议和回包；如有 MFi 通路，需要对应支持与协议资料。
+- 0.2.0 查询是否收到 CRC 与结构校验通过的传输能力回应，以及实际版本与能力字段。
+- 依据对应版本，验证身份挑战、密钥协商及业务初始化的真实请求／回应。
+- 明确哪一步使手表退出等待确认、进入正常使用；手机端静态代码不能证明固件界面的转换条件。
 
 未发现广播、连接超时、没有标准电量或主动断开，均不足以单独证明设备彻底不兼容。完整的通知或健康同步仍取决于可用传输和设备端协议，不由界面移植或 SDK 升级自动完成。
