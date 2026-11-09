@@ -13,6 +13,13 @@ case "${1:-}" in
     cat build/simulator-list.log
     simulator_id="$(python3 scripts/select-simulator.py < build/simulator-devices.json)"
     printf 'Testing on iPhone simulator: %s\n' "$simulator_id"
+    # Compile every test target before waiting for a cold simulator boot. A
+    # test-only compiler error should fail immediately, not after that wait.
+    xcodebuild build-for-testing -project WatchLink.xcodeproj -scheme WatchLink -configuration Debug \
+      -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
+      -derivedDataPath build/Simulator \
+      CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+      | tee build/simulator-build.log
     python3 scripts/run-bounded.py 420 xcrun simctl bootstatus "$simulator_id" -b \
       2>&1 | tee build/simulator-boot.log
     result_path="$project_root/build/TestResults.xcresult"
@@ -20,7 +27,7 @@ case "${1:-}" in
       result_path="$project_root/build/TestResults-$(date +%Y%m%d-%H%M%S)-$$.xcresult"
     fi
     printf '%s\n' "$result_path" > build/test-result-path.txt
-    xcodebuild test -project WatchLink.xcodeproj -scheme WatchLink -configuration Debug \
+    xcodebuild test-without-building -project WatchLink.xcodeproj -scheme WatchLink -configuration Debug \
       -destination "platform=iOS Simulator,id=$simulator_id" -destination-timeout 60 \
       -derivedDataPath build/Simulator -resultBundlePath "$result_path" \
       -parallel-testing-enabled NO -test-timeouts-enabled YES \

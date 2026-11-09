@@ -199,17 +199,26 @@ final class OppoBusinessWireTests: XCTestCase {
         var boundedDecoder = OppoTransportDecoder(emitBusinessMessages: true)
         XCTAssertEqual(try encryptedMessage(boundedDecoder.append(bounded.reduce(Data(), +))).payload, maximum)
 
-        let oversized = framed(Data(repeating: 0x35, count: 509), control: 0x41, sequence: 0)
-            + framed(Data(repeating: 0x35, count: 509), control: 0x42, sequence: 1)
-            + framed(Data(repeating: 0x35, count: 7), control: 0x43, sequence: 2)
+        var oversized: Data = framed(Data(repeating: 0x35, count: 509), control: 0x41, sequence: 0)
+        oversized.append(framed(Data(repeating: 0x35, count: 509), control: 0x42, sequence: 1))
+        oversized.append(framed(Data(repeating: 0x35, count: 7), control: 0x43, sequence: 2))
         var oversizedDecoder = OppoTransportDecoder(emitBusinessMessages: true)
         XCTAssertTrue(oversizedDecoder.append(oversized).isEmpty)
         XCTAssertEqual(oversizedDecoder.diagnostics.lastIssue, "OVERSIZED_MESSAGE")
         XCTAssertEqual(try encryptedMessage(oversizedDecoder.append(hex(encryptedSingle))).payload, hex(envelope))
 
-        let excessiveFragments = (0..<65).map { index in
-            framed(Data([0x35]), control: index == 0 ? 0x41 : (index == 64 ? 0x43 : 0x42), sequence: UInt8(index))
-        }.reduce(Data(), +)
+        var excessiveFragments = Data()
+        let fragmentPayload = Data([UInt8(0x35)])
+        for index in 0..<65 {
+            let control: UInt16
+            switch index {
+            case 0: control = 0x41
+            case 64: control = 0x43
+            default: control = 0x42
+            }
+            let frame: Data = framed(fragmentPayload, control: control, sequence: UInt8(index))
+            excessiveFragments.append(frame)
+        }
         var fragmentDecoder = OppoTransportDecoder(emitBusinessMessages: true)
         XCTAssertTrue(fragmentDecoder.append(excessiveFragments).isEmpty)
         XCTAssertEqual(fragmentDecoder.diagnostics.lastIssue, "OVERSIZED_MESSAGE")
@@ -246,11 +255,14 @@ final class OppoBusinessWireTests: XCTestCase {
     // Fault-injection helper only. Encoding/CRC correctness above is checked
     // against independent fixed fixtures, not a second copy of the codec.
     private func framed(_ payload: Data, control: UInt16, sequence: UInt8? = nil) -> Data {
-        let body = Data([UInt8(control & 0xff), UInt8(control >> 8)])
-            + (sequence.map { Data([$0]) } ?? Data()) + payload
+        var body = Data([UInt8(control & 0xff), UInt8(control >> 8)])
+        if let sequence { body.append(sequence) }
+        body.append(payload)
         let length = body.count < 128 ? Data([UInt8(body.count)])
             : Data([UInt8(body.count & 0x7f) | 0x80, UInt8(body.count >> 7)])
-        var bytes = Data([0xaa]) + length + body
+        var bytes = Data([UInt8(0xaa)])
+        bytes.append(length)
+        bytes.append(body)
         let checksum = OppoProtocol.crc16(bytes)
         bytes.append(contentsOf: [UInt8(checksum & 0xff), UInt8(checksum >> 8)])
         return bytes
