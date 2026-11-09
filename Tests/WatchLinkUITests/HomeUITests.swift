@@ -22,7 +22,7 @@ final class HomeUITests: XCTestCase {
         add(screenshot)
     }
 
-    func testFirstReportContainsSnapshotAndExplicitUnsupportedStages() {
+    func testFirstReportContainsSnapshotAndExplicitUnsupportedStages() throws {
         let app = XCUIApplication()
         app.launchArguments = ["--ui-testing"]
         app.launch()
@@ -40,12 +40,13 @@ final class HomeUITests: XCTestCase {
             predicate: NSPredicate(format: "value == %@", "已展开"), object: disclosure)
         XCTAssertEqual(XCTWaiter.wait(for: [expanded], timeout: 5), .completed)
 
-        // Match the Text's actual identifier, rather than asking every element
-        // type for all identifier/label/value aliases in the accessibility tree.
-        let preview = app.staticTexts
+        // Read the native text view's complete, displayed report once. The
+        // human accessibility label is deliberately separate from its content.
+        let preview = app.textViews
             .matching(NSPredicate(format: "identifier == %@", "reportJSONPreview")).firstMatch
         XCTAssertTrue(preview.waitForExistence(timeout: 5))
-        let reportText = preview.label
+        let reportText = try XCTUnwrap(preview.value as? String,
+                                      "The report text view must expose its actual JSON text.")
         XCTAssertTrue(reportText.contains("schemaVersion"))
         XCTAssertTrue(reportText.contains("UNAVAILABLE_VIA_PUBLIC_IOS_API"))
         XCTAssertTrue(reportText.contains("NOT_IMPLEMENTED"))

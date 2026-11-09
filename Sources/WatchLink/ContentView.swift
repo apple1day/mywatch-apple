@@ -502,11 +502,8 @@ private struct ReportView: View {
                     .accessibilityIdentifier("reportDisclosure")
                     .accessibilityValue(showJSON ? "已展开" : "已折叠")
                     if showJSON {
-                        Text(String(data: snapshot, encoding: .utf8) ?? "报告编码不可用")
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.primary)
-                            .textSelection(.enabled)
-                            .accessibilityIdentifier("reportJSONPreview")
+                        ReportJSONPreview(text: String(data: snapshot, encoding: .utf8) ?? "报告编码不可用")
+                            .frame(height: 360)
                     }
                 }
             }
@@ -530,5 +527,35 @@ private struct ReportView: View {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         return formatter.string(from: Date())
+    }
+}
+
+/// Keep the list row bounded while UIKit handles scrolling and selection of the
+/// complete report. Accessibility reads the text view's actual text value.
+private struct ReportJSONPreview: UIViewRepresentable {
+    let text: String
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = true
+        view.font = UIFontMetrics(forTextStyle: .caption1).scaledFont(
+            for: UIFont.monospacedSystemFont(ofSize: 12, weight: .regular))
+        view.adjustsFontForContentSizeCategory = true
+        view.textColor = .label
+        view.backgroundColor = .clear
+        view.textContainerInset = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
+        view.textContainer.lineFragmentPadding = 0
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.accessibilityIdentifier = "reportJSONPreview"
+        view.accessibilityLabel = "诊断报告 JSON"
+        view.text = text
+        return view
+    }
+
+    func updateUIView(_ view: UITextView, context: Context) {
+        // Avoid resetting the user's selection and scroll position on redraw.
+        if view.text != text { view.text = text }
     }
 }
