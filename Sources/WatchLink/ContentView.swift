@@ -399,6 +399,7 @@ private struct ReportView: View {
     let snapshot: Data
     @Environment(\.dismiss) private var dismiss
     @State private var isExporting = false
+    @State private var showJSON = false
     @State private var exportStatus: String?
 
     var body: some View {
@@ -420,13 +421,24 @@ private struct ReportView: View {
                     if let status = exportStatus { Text(status).font(.footnote) }
                 }
                 Section {
-                    DisclosureGroup("查看报告内容") {
+                    Button { showJSON.toggle() } label: {
+                        HStack {
+                            Text(showJSON ? "收起报告内容" : "查看报告内容")
+                            Spacer()
+                            Image(systemName: showJSON ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("reportDisclosure")
+                    .accessibilityValue(showJSON ? "已展开" : "已折叠")
+                    if showJSON {
                         Text(String(data: snapshot, encoding: .utf8) ?? "报告编码不可用")
                             .font(.caption.monospaced())
+                            .foregroundStyle(.primary)
                             .textSelection(.enabled)
                             .accessibilityIdentifier("reportJSONPreview")
                     }
-                    .accessibilityIdentifier("reportDisclosure")
                 }
             }
             .navigationTitle("诊断报告")

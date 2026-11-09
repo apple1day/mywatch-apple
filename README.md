@@ -72,7 +72,11 @@ bash setup.sh
 
 [查看 GitHub Actions](https://github.com/apple1day/mywatch-apple/actions)
 
-CI 使用 macOS 与 Xcode，生成工程后执行纯模型测试、模拟器界面检查及无签名真机目标构建。检查范围和手动验收项目见 [验证说明](docs/VALIDATION.md)。
+CI 使用 macOS 与 Xcode，先完成并上传无签名真机目标构建，再执行纯模型测试和模拟器界面检查。检查范围和手动验收项目见 [验证说明](docs/VALIDATION.md)。
+
+- `WatchLink-iOS-device-build`：无签名 iPhone/iPad 应用 ZIP、校验值和产物说明。
+- `WatchLink-iOS-simulator-build`：测试通过后生成的模拟器应用 ZIP。
+- `WatchLink-test-results`：测试结果、模拟器截图与构建日志。
 
 CI 产物中的模拟器 `.app` 用于模拟器；无签名设备 `.app` ZIP 用于构建检查，安装到 iPhone 仍需要你的开发签名。它们不代表已经生成可直接侧载的已签名 IPA，也不代表实体手表测试通过。
 

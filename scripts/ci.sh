@@ -7,9 +7,14 @@ mkdir -p build dist
 case "${1:-}" in
   test)
     python3 scripts/test-signing-preservation.py
-    simulator_id="$(xcrun simctl list devices available -j | python3 scripts/select-simulator.py)"
+    python3 scripts/run-bounded.py 120 xcrun simctl list devices available -j \
+      > build/simulator-devices.json 2> build/simulator-list.log \
+      || { result=$?; cat build/simulator-list.log >&2; exit "$result"; }
+    cat build/simulator-list.log
+    simulator_id="$(python3 scripts/select-simulator.py < build/simulator-devices.json)"
     printf 'Testing on iPhone simulator: %s\n' "$simulator_id"
-    xcrun simctl bootstatus "$simulator_id" -b
+    python3 scripts/run-bounded.py 420 xcrun simctl bootstatus "$simulator_id" -b \
+      2>&1 | tee build/simulator-boot.log
     result_path="$project_root/build/TestResults.xcresult"
     if [[ -e "$result_path" ]]; then
       result_path="$project_root/build/TestResults-$(date +%Y%m%d-%H%M%S)-$$.xcresult"
@@ -39,6 +44,7 @@ WatchLink 0.1.0 build artifacts
 
 WatchLink-iOS-simulator-0.1.0.zip contains an iOS Simulator app.
 WatchLink-iOS-unsigned-0.1.0.zip contains an UNSIGNED physical-device app.
+The device and simulator ZIPs are published as separate CI artifacts.
 
 Neither file is a signed IPA for direct installation on an iPhone.
 To install on your own iPhone, clone the repository on a Mac, run
