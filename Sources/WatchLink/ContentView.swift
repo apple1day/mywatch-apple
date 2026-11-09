@@ -428,6 +428,7 @@ private struct ReportView: View {
                             Image(systemName: showJSON ? "chevron.up" : "chevron.down")
                                 .font(.caption.weight(.semibold))
                         }
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("reportDisclosure")

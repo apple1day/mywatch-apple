@@ -32,10 +32,13 @@ final class HomeUITests: XCTestCase {
         exportButton.tap()
         XCTAssertTrue(app.buttons["saveJSONButton"].waitForExistence(timeout: 5))
 
-        let disclosure = app.descendants(matching: .any)
-            .matching(identifier: "reportDisclosure").firstMatch
+        let disclosure = app.buttons["reportDisclosure"]
         XCTAssertTrue(disclosure.waitForExistence(timeout: 5))
+        XCTAssertTrue(disclosure.isHittable)
         disclosure.tap()
+        let expanded = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value == %@", "已展开"), object: disclosure)
+        XCTAssertEqual(XCTWaiter.wait(for: [expanded], timeout: 5), .completed)
 
         let preview = app.descendants(matching: .any)
             .matching(identifier: "reportJSONPreview").firstMatch
