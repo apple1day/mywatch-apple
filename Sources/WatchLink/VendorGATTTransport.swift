@@ -77,6 +77,10 @@ final class VendorGATTTransport {
     /// They do not certify the current link, system pairing, or vendor authentication.
     private(set) var commandNotificationsEnabled = false
     private(set) var fileNotificationsEnabled = false
+    private(set) var commandNotificationActivation = "NOT_REQUESTED"
+    private(set) var fileNotificationActivation = "NOT_REQUESTED"
+    private(set) var commandNotificationCallbackCount = 0
+    private(set) var fileNotificationCallbackCount = 0
 
     var isReady: Bool { state == .ready }
     var isWriting: Bool { !outgoing.isEmpty }
@@ -98,6 +102,7 @@ final class VendorGATTTransport {
         self.commandWrite = commandWrite
         self.commandNotify = commandNotify
         self.fileNotify = fileNotify
+        if fileNotify == nil { fileNotificationActivation = "NOT_PRESENT" }
         self.onReady = onReady
         self.onReceived = onReceived
         self.onFragmentSubmitted = onFragmentSubmitted
@@ -188,11 +193,19 @@ final class VendorGATTTransport {
         requireMainThread()
         guard device === peripheral, state == .subscribing || state == .ready,
               let channel = channel(for: characteristic) else { return }
+        switch channel {
+        case .command: commandNotificationCallbackCount += 1
+        case .file: fileNotificationCallbackCount += 1
+        }
         let wasEnabled = channel == .command ? commandNotificationsEnabled : fileNotificationsEnabled
         recordNotificationState(characteristic, channel: channel)
         if state == .ready {
-            if let error { fail(phase: notificationPhase(channel), error: error) }
+            if let error {
+                recordActivation("STATE_ERROR", channel: channel)
+                fail(phase: notificationPhase(channel), error: error)
+            }
             else if !characteristic.isNotifying {
+                recordActivation("DISABLED", channel: channel)
                 reject(phase: notificationPhase(channel), code: 4, message: "已启用的通知通道被关闭。")
             }
             return
@@ -201,8 +214,12 @@ final class VendorGATTTransport {
             // A previously enabled command channel may be lost while the file
             // notification subscription is still pending.
             if wasEnabled {
-                if let error { fail(phase: notificationPhase(channel), error: error) }
+                if let error {
+                    recordActivation("STATE_ERROR", channel: channel)
+                    fail(phase: notificationPhase(channel), error: error)
+                }
                 else if !characteristic.isNotifying {
+                    recordActivation("DISABLED", channel: channel)
                     reject(phase: notificationPhase(channel), code: 4, message: "通知初始化期间，已启用的通道被关闭。")
                 }
             }
@@ -210,11 +227,17 @@ final class VendorGATTTransport {
         }
         cancelDeadline()
         expectedSubscription = nil
-        if let error { fail(phase: notificationPhase(channel), error: error); return }
+        if let error {
+            recordActivation("ENABLE_FAILED", channel: channel)
+            fail(phase: notificationPhase(channel), error: error)
+            return
+        }
         guard characteristic.isNotifying else {
+            recordActivation("ENABLE_UNCONFIRMED", channel: channel)
             reject(phase: notificationPhase(channel), code: 4, message: "系统回调未确认通知通道已启用。")
             return
         }
+        recordActivation("ENABLE_CONFIRMED", channel: channel)
         subscribeNext()
     }
 
@@ -290,7 +313,11 @@ final class VendorGATTTransport {
             let characteristic = subscriptionQueue.removeFirst()
             guard let channel = channel(for: characteristic) else { continue }
             recordNotificationState(characteristic, channel: channel)
-            if characteristic.isNotifying { continue }
+            if characteristic.isNotifying {
+                recordActivation("ALREADY_ENABLED", channel: channel)
+                continue
+            }
+            recordActivation("ENABLE_REQUESTED", channel: channel)
             expectedSubscription = characteristic
             setDeadline(seconds: 90, phase: notificationPhase(channel), code: 7,
                         message: "通知启用超时；请完成 iOS 系统配对提示后重新连接。")
@@ -343,6 +370,13 @@ final class VendorGATTTransport {
 
     private func notificationPhase(_ channel: Channel) -> String {
         channel == .command ? "COMMAND_SUBSCRIPTION" : "FILE_SUBSCRIPTION"
+    }
+
+    private func recordActivation(_ value: String, channel: Channel) {
+        switch channel {
+        case .command: commandNotificationActivation = value
+        case .file: fileNotificationActivation = value
+        }
     }
 
     private func setDeadline(seconds: TimeInterval, phase: String, code: Int, message: String) {

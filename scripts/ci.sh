@@ -36,7 +36,7 @@ case "${1:-}" in
       | tee build/simulator-test.log
     simulator_app="$project_root/build/Simulator/Build/Products/Debug-iphonesimulator/WatchLink.app"
     [[ -d "$simulator_app" ]] || { printf 'Simulator app missing after successful test.\n' >&2; exit 1; }
-    ditto -c -k --sequesterRsrc --keepParent "$simulator_app" dist/WatchLink-iOS-simulator-0.4.0.zip
+    ditto -c -k --sequesterRsrc --keepParent "$simulator_app" dist/WatchLink-iOS-simulator-0.4.1.zip
     ;;
   device)
     xcodebuild build -project WatchLink.xcodeproj -scheme WatchLink -configuration Release \
@@ -45,12 +45,12 @@ case "${1:-}" in
       | tee build/device-build.log
     device_app="$project_root/build/Device/Build/Products/Release-iphoneos/WatchLink.app"
     [[ -d "$device_app" ]] || { printf 'Device app missing after successful build.\n' >&2; exit 1; }
-    ditto -c -k --sequesterRsrc --keepParent "$device_app" dist/WatchLink-iOS-unsigned-0.4.0.zip
+    ditto -c -k --sequesterRsrc --keepParent "$device_app" dist/WatchLink-iOS-unsigned-0.4.1.zip
     cat > dist/BUILD-ARTIFACTS.txt <<'INFO'
-WatchLink 0.4.0 build artifacts
+WatchLink 0.4.1 build artifacts
 
-WatchLink-iOS-simulator-0.4.0.zip contains an iOS Simulator app.
-WatchLink-iOS-unsigned-0.4.0.zip contains an UNSIGNED physical-device app.
+WatchLink-iOS-simulator-0.4.1.zip contains an iOS Simulator app.
+WatchLink-iOS-unsigned-0.4.1.zip contains an UNSIGNED physical-device app.
 The device and simulator ZIPs are published as separate CI artifacts.
 
 Neither file is a signed IPA for direct installation on an iPhone.

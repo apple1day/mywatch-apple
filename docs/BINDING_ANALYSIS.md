@@ -1,13 +1,15 @@
 # 一代国行 OnePlus Watch：连接、身份与绑定证据
 
-更新：2026-11-09。本文记录 WatchLink **0.4.0（构建 5，报告 schema 5）** 的实现边界及后续协议工作的依据。分析来自用户提供的欢太健康 APK、经脱敏归纳的实机报告与照片，以及 Apple 官方文档；没有运行目标 APK 或其原生库。
+更新：2026-11-09。本文记录 WatchLink **0.4.1（构建 6，报告 schema 6）** 的实现边界及后续协议工作的依据。分析来自用户提供的欢太健康 APK、经脱敏归纳的实机报告与照片，以及 Apple 官方文档；没有运行目标 APK 或其原生库。
 
-**最新照片已显示协议版本 5、传输身份“已通过”，手表仍在手动配对画面。0.4.0 在身份成功后保留业务会话，允许用户发送已核实的开始设置请求及状态查询。它尚未实现账号登录、云绑定或完整首次设置；手表报告设置完成也不会被记为账号绑定成功。照片没有对应的完整 JSON，因此不能推断实际加密分支或每一步的实表交互。**
+**早前照片显示协议版本 5、传输身份“已通过”，最新 18:03 截图却在取得完整能力之前停止；身份和首次设置尚未开始，不能称为最后一步登录失败。0.4.1 针对能力查询仅发送一次的实现缺口，补上相同请求的有界重试和接收诊断。0.4.0 加入的首次设置开始与状态查询继续保留。账号登录、云绑定及完整首次设置仍未实现；目前尚无与 18:03 截图对应的新版本完整 JSON，不能断定本次失败的根因。**
 
-## 0. 0.4.0 的实际实现与门禁
+## 0. 0.4.1 的实际实现与门禁
 
+- `VendorCapabilityQuery` 管理同一连接中 `1/1` 的首发和最多 3 次重试。每次实际提交至少 2 秒且全部 ATT 分片确认后，尚未取得完整有效能力才允许重发。能力一旦有效就停止安排新重试；已排队或提交的当前查询仍须完成，首次主动能力也不跳过首发查询及确认。
 - `OppoAuthentication` 是一次性身份状态机：真实完整能力 → `1/24` 随机值 → `1/25` 反码挑战 → 按能力位决定 `1/36` RSA / `1/37` AES 会话证明 → `1/37 state=1` 写确认。
 - 查询必须实际获得 ATT 确认才开始身份流程。查询后的能力优先；查询前主动能力也可用于版本选择，但来源独立记录，不能追认为查询应答。先校验同一通知批次和历史观测中的能力一致性，再处理可能完成认证的回复；矛盾参数会停止流程。
+- 重试不重置接收器、不重新标记首次查询的流偏移，也不延长从首次实际提交起算的 45 秒总窗口；只重发已经核实的原查询，不新增私有前置消息。每轮最多 10 条逻辑命令，容纳 4 次能力查询、4 条身份消息和 2 条设置消息。
 - 每个阶段在首个 ATT 分片真正提交前记录命令流偏移；排队前或旧首片开始的消息不用于新阶段。原厂没有事务 ID，这一时间边界不宣称严格事务证明；身份挑战另与本次随机挑战匹配。
 - 回复可早于 ATT 回调，但必须等该逻辑命令的全部分片成功写入后才推进。最后的 `state=1` 也必须写入成功；没有照抄 APK 在失败回调中仍标协商完成的行为。
 - 保持完整 TL 帧不超过 `min(20, peer frame, peer MTU, actual ATT maximum)`；协商间隔以毫秒作用于分片及跨命令发送。超过 1000 ms 的间隔或无法在界限内编码的帧明确失败，不扩大到未知传输参数。
@@ -16,10 +18,10 @@
 - 用户点击“继续首次设置”后，`OppoSetup` 才发送 `11/7` 的 `08 01 10 02`；收到整条命令的全部 ATT 确认后发送一次空 protobuf 的 `11/11`。查询写确认前的有效新状态有限缓存，写失败不采用；查询前开始的状态另存为 `preQueryObservation`。
 - 业务封装严格遵循实际协商模式。加密分支先将完整 SID/CID/protobuf 用 AES 封装，再分片，每片带 `0x40`；收齐并检查 CRC 后才解密。已协商加密时不退回明文，跨片加密标志变化或模式不符不会被当作有效设置状态。
 - `11/11`、`11/12` 的有效状态 `0`、`10...59` 保持待完成；仅 `60` 标记 `DEVICE_SETUP_FINISHED_REPORTED`。查询首片实际提交后固定观察 45 秒，不因状态通知延长。到期仍在进行则记 `DEVICE_SETUP_PENDING`，未知状态记 `DEVICE_STATE_UNRECOGNIZED`，没有本轮有效状态则明确超时；所有结果均保留 `accountBinding=NOT_IMPLEMENTED`。
-- schema 4 的 `authentication` 与 `commandWrites` 保留；schema 5 新增 `initialSetup`、`businessSessionState`、`businessEncrypted`，逐命令增加 `serviceID` 和 `encrypted`。只记录阶段、来源、数值状态、证明结果与 ATT 分片计数，不保存 nonce、挑战、密钥、验证密文或原始 protobuf。
-- 界面区分选择设备、GATT、能力、传输身份、首次设置与账号绑定。按钮按真实阶段和终态显示文案，灰色本身不是成功标志。
+- schema 4 的 `authentication` 与 `commandWrites`、schema 5 的 `initialSetup / businessSessionState / businessEncrypted` 及逐命令 `serviceID / encrypted` 保留；schema 6 新增 `capabilityQuery` 与能力查询记录的 `queryAttempt`。只记录阶段、来源、数值状态、证明结果与 ATT 分片计数，不保存 nonce、挑战、密钥、验证密文或原始 protobuf。
+- 界面区分选择设备、GATT、能力、传输身份、首次设置与账号绑定。按钮按真实阶段和终态显示文案，灰色本身不是成功标志。命令／文件收包数在为 0 时也显示，能力失败按实际接收事实分类；导出显示版本及生成时间，文件名包含 `v0.4.1-b6-` 和时间，方便核对同一轮报告。
 
-实现入口为 [`OppoAuthentication`](../Sources/WatchLink/OppoAuthentication.swift)、[`OppoBusinessSession`](../Sources/WatchLink/OppoBusinessSession.swift)、[`OppoProtocol`](../Sources/WatchLink/OppoProtocol.swift)、[`OppoSetup`](../Sources/WatchLink/OppoSetup.swift) 与 [`BluetoothMonitor`](../Sources/WatchLink/BluetoothMonitor.swift)。自动检查结果以本次提交的 CI 为准；测试向量来自独立重建和标准向量，不能冒称官方或手表抓包。
+实现入口为 [`VendorCapabilityQuery`](../Sources/WatchLink/VendorCapabilityQuery.swift)、[`OppoAuthentication`](../Sources/WatchLink/OppoAuthentication.swift)、[`OppoBusinessSession`](../Sources/WatchLink/OppoBusinessSession.swift)、[`OppoProtocol`](../Sources/WatchLink/OppoProtocol.swift)、[`OppoSetup`](../Sources/WatchLink/OppoSetup.swift) 与 [`BluetoothMonitor`](../Sources/WatchLink/BluetoothMonitor.swift)。自动检查结果以本次提交的 CI 为准；测试向量来自独立重建和标准向量，不能冒称官方或手表抓包。
 
 ## 1. 实机已经证明什么
 
@@ -33,9 +35,13 @@
 
 后续 **0.2.0 实机报告**提供了进一步证据：命令和文件通知均启用；收到 **30 次通知、572 字节**，其中 **29 次在提交查询之前**。提交查询后的首条被处理的命令通知含有通过长度、CRC 和已知 control 检查的后续分片，但接收器没有首片缓存，抛出 `UNEXPECTED_FRAGMENT` 并终止探针。GATT 仍然连接。
 
-因此不能再将现状描述为“没有厂商通道数据”：已经收到有效外层帧的后续片，尚未获得完整能力消息。旧报告合并统计命令和文件通知，且没有逐帧元数据，**不能证明前 29 次通知全是这一命令的前导分片，也不能还原具体 FSN**。报告中的 `attWriteAcknowledged=false` 仅表示当时没有记录到 ATT 确认，不等于系统明确报告写入失败。
+因此不能将 **0.2.0 这一轮**描述为“没有厂商通道数据”：已经收到有效外层帧的后续片，尚未获得完整能力消息。旧报告合并统计命令和文件通知，且没有逐帧元数据，**不能证明前 29 次通知全是这一命令的前导分片，也不能还原具体 FSN**。报告中的 `attWriteAcknowledged=false` 仅表示当时没有记录到 ATT 确认，不等于系统明确报告写入失败。
 
-**更新后的用户照片**进一步显示：App 的蓝牙通道已连接、协议能力已取得、传输身份已通过，协议版本显示为 5；手表仍停留在“手动配对／请选择该手表配对”画面。这是用户提供的当前界面观测，不能再笼统描述为“目前只到 BLE 扫描”。但尚未取得与该照片对应的完整诊断 JSON，不能据此核实 `supportProtocol`、RSA/AES 分支、全部写入回调或消息来源，也没有账号登录失败、云服务关闭或手表完成首次设置的证据。0.4.0 的设置请求和状态观察尚待新一轮实表报告。
+**此前身份通过的用户照片**进一步显示：App 的蓝牙通道已连接、协议能力已取得、传输身份已通过，协议版本显示为 5；手表仍停留在“手动配对／请选择该手表配对”画面。这是一次真实界面观测，说明曾推进到传输身份，不能因另一轮失败而将其抹去。但尚未取得与该照片对应的完整诊断 JSON，不能据此核实 `supportProtocol`、RSA/AES 分支、全部写入回调或消息来源，也没有账号登录失败、云服务关闭或手表完成首次设置的证据。0.4.0 的设置请求和状态观察尚待新一轮实表报告。
+
+**最新 18:03 截图**显示另一轮验证：GATT 已连接，当前查询 `1/1` 个 ATT 分片已确认；能力仍在等待，传输身份及首次设置均未开始，错误为未取得可用于身份认证的完整能力。该截图只能确认卡在能力阶段，不能把“写入完成”解释为手表已处理请求，也不能判断是未发通知、只发了无关通知，还是完整消息没有解析出来。旧 UI 在总通知数为 0 时隐藏收包行，因此截图未显示该行值得核对，但不能替代当轮报告中的计数。
+
+随后提供的附件实际上仍是 **0.2.0 / build 2 / schema 2**，`generatedAt=2026-11-09T06:11:32Z`，即北京时间 **14:11:32**。它对应前述旧分片错误，不能作为 18:03 这次更新后能力超时的收包证据，也不能用于判断 0.4.1 是否修复。下一轮必须同时核对版本、构建号与生成时间。
 
 本文不保存设备名后缀、匿名设备标识、照片或完整原始报告。标准设备信息中的字符串也不能单独用于确认内部芯片或固件实现。
 
@@ -45,8 +51,8 @@
 | --- | --- | --- |
 | Core Bluetooth / GATT | `didConnect`、服务发现、标准读取和连接保持 | 厂商身份认证或业务绑定完成 |
 | 系统 SMP 配对及密钥保存 | 用户观察到并确认了系统数字弹窗 | 本项目已经独立验证 SMP 完成或 bonding 密钥已持久保存 |
-| 厂商传输与身份 | 0.2.0 报告有有效后续分片；最新照片显示能力已取得、版本 5、身份已通过 | 仅凭照片确定实际加密分支、完整消息时序或账号绑定完成 |
-| 首次设置与账号绑定 | 最新照片中手表仍处于手动配对；0.4.0 新增开始请求及状态观察 | 已激活、账号已绑定，或反过来认定必须登录失败／已无法使用 |
+| 厂商传输与身份 | 0.2.0 报告有有效后续分片；早前照片显示版本 5、身份已通过；18:03 的另一轮停在能力阶段 | 将不同轮次合并成一份结果，或仅凭照片确定实际加密分支、完整时序及账号状态 |
+| 首次设置与账号绑定 | 身份通过照片中手表仍处于手动配对；0.4.0 新增开始请求及状态观察，18:03 这一轮尚未启动 | 已激活、账号已绑定，或反过来认定必须登录失败／已无法使用 |
 
 Apple 将 `didConnect` 定义为与外设连接成功，`CBPeripheral.state` 表示连接状态。这些项目中已有的观察不能充当系统配对完成回执。系统配对、保存配对密钥和厂商应用协议分别处理不同问题；即使前一层成功，仍需验证后续层。相关官方链接见文末。
 
@@ -87,6 +93,34 @@ aa 0e 00 00 01 01 08 05 10 14 18 14 20 0a 28 03 2c 16
 
 应答使用同一消息结构。官方分派以 `sid=1` 和 `cid & 0x7f == 1` 匹配，故 `cid=0x01` 与 `0x81` 都可能进入该分支；没有在这里发现请求计数器。当前实现将完整请求的原样回显单独判为歧义，避免把回环当作成功协商。
 
+### 0.4.1 的查询重试依据与范围
+
+原厂 `ot0.a`（`ClientConsultHelper`）的 `M()` 每次构造上述同一个 `TransportConsult`，先调用 `Q(1, nd0.b.SCORLL_DELAYED)`，再通过 `F(1, 1, ...)` 发送。该常量在 APK 的 `classes18.dex` 中为 **2000 ms**，`M()` 内实际调用也已核对为 2000。其超时 Runnable 仅在当前等待类型 `m == 1` 且重试计数 `l < 3` 时递增计数并再次调用 `M()`；因此是 **首发 + 最多 3 次重试**，并非无限重发。`D()` 接收能力后取消当前计时并转入能力选择的身份分支；`b()` 在清理时归零重试数。
+
+之前 iOS 版本只发一次能力查询。0.4.1 采用相同已核实请求的重试次数和 2 秒等待，并增加本地完整 ATT 确认门禁：从每次首片实际提交时开始计时，2 秒先到而 ACK 未完整时继续等待，不并发重复写。完整有效能力停止新重试；如果当前查询已经排队或提交，仍等待这一条完整写确认才进入身份。首次查询前已收到有效主动能力时仍执行并确认首发查询，保留其主动来源。
+
+这一调整补齐了可定位的鲁棒性缺口，**不能由此断言最新故障一定由首包丢失引起，也不保证重试可使本固件恢复响应**。本版仍从首次实际提交起最多等待 45 秒，后续重试不延长；保留同一连续解析器及首次归属边界，不能将前置半帧或旧首片重新归为新查询。原厂消息没有 transaction ID，`queryAttempt` 仅标明发送轮次及其 ATT 结果，不能严格对应某一能力回包。
+
+schema 6 的 `vendorProtocol.capabilityQuery` 记录 `status`、`queuedAttempts`、`submittedAttempts`、`acknowledgedAttempts`、`currentAttempt`、`maximumAttempts=4`、`retryDelayMilliseconds=2000`、`hasCapabilities`。轮次从 1 开始；排队、实际首片提交和整条写入确认分别计数。逐命令 `commandWrites.queryAttempt` 关联该轮写入，旧 `requestSubmitted / querySubmittedAt / attWriteAcknowledged / attWriteCallbackObserved / attWriteCompletedAt / attWriteError` 字段继续只表示首次查询，不改成最后一次或所有重试的汇总。
+
+查询状态依次区分 `NOT_STARTED`、`QUERY_QUEUED`、`WAITING_FOR_WRITE_ACK`、`WAITING_FOR_CAPABILITIES`、`READY_FOR_AUTHENTICATION`；失败和中断另记为 `FAILED`、`INTERRUPTED`。第 4 次查询确认后仍没有能力时，保持等待直至首次查询的 45 秒截止或后续有效能力，不沿用原厂约 8 秒的整轮超时。这里的“可进入身份”只表示能力及查询写入门禁满足，身份是否通过仍由独立认证结果决定。
+
+能力总窗口到期时，`vendorProtocol.capabilityTimeoutReason` 按以下优先顺序分类，仍使用 `error.phase=PROTOCOL_RESPONSE`、`code=1001`。分类描述接收与写入状态，不把推测的重连、配对或固件问题写成根因。
+
+| 超时分类 | 已观测条件 |
+| --- | --- |
+| `CAPABILITY_WRITE_INCOMPLETE` | 已排队查询数大于完整确认数 |
+| `CAPABILITIES_OBSERVED_NOT_ADVANCED` | 已有完整能力观测，但协商未进入下一阶段 |
+| `NO_NOTIFICATIONS` | 命令与文件均未收到数据通知 |
+| `FILE_NOTIFICATIONS_ONLY` | 收到通知，但命令通道计数为 0 |
+| `EMPTY_COMMAND_NOTIFICATIONS` | 命令通知存在，但累计命令字节数为 0 |
+| `INCOMPLETE_COMMAND_MESSAGE` | 已有命令字节，解析器仍有未收齐内容 |
+| `NO_VALID_CAPABILITIES` | 已有命令字节，没有可用完整能力，且没有待收齐内容 |
+
+`commandNotificationActivation / fileNotificationActivation` 另区分通知原本已开启 `ALREADY_ENABLED`、本轮已请求开启 `ENABLE_REQUESTED`、已收到成功状态回调 `ENABLE_CONFIRMED` 等观测；`commandNotificationCallbackCount / fileNotificationCallbackCount` 是通知状态回调数，不能与数据通知数混淆。这些新增诊断没有改变通知订阅行为。
+
+还核对到原厂 Android `GattConnection` 的关闭／连接路径：关闭时记录时间，重新 `connectGatt` 前可等待补足约 2 秒。它与上述 `TransportConsult` 重试是不同机制；当前缺少证明 iOS 这次失败由重连间隔引起的实测依据，**0.4.1 未据此增加 iOS 自动重连或固定延迟**。已查看的连接完成 → consult helper → `M()` 调用链没有发现必须插入的额外私有前置请求。`D()` 本轮只采用第一次能力的标志也不能证明手表固件一生、一次配对或一次连接只发送一次主动能力。
+
 ### 外层帧及 CRC
 
 来源：`ps0.g.j()` 编码，`ps0.g.u()` 字节流及 CRC 检查，`ps0.g.n()` 分片重组，`dt0.a.a()` CRC。
@@ -125,11 +159,11 @@ AA | bodyLength | control LE16 | [FSN UInt8] | payload | CRC16
 
 ATT 回调也独立记录：即使协议解析已结束，只要同一有效连接和对应写特征的回调随后到达，仍记录写入确认或错误，不覆盖既有协议结果。旧连接回调不能更新新会话；已导出的报告快照不会被事后改写。
 
-这些修改解决可定位的接收缺陷。针对性回归及执行边界见 [验证方法](VALIDATION.md)。旧 0.2.0 报告无法验证修复后的行为；当前最新照片的进度已超过当时，仍需对应完整 JSON 核实具体交互。
+这些修改解决可定位的接收缺陷。针对性回归及执行边界见 [验证方法](VALIDATION.md)。旧 0.2.0 报告无法验证修复后的行为；早前身份通过照片和最新能力阶段失败截图也属于不同连接，仍需各自对应的完整 JSON 核实具体交互。
 
 ## 4. 身份分支的静态依据与实表边界
 
-分支入口为 `ot0.a.D()`：根据实际 `protocolVersion` 选择流程，并读取 `supportProtocol & 3`。不能在未收到应答前假定协议版本，或只凭版本号跳入某个加密分支。0.3.0 已将下列版本 3–5 分支接入 App；最新照片显示这块表的版本为 5、身份已通过，**尚无对应完整 JSON 可核实本轮实际选择的加密能力及详细交互**。旧版本分支仍未实现。
+分支入口为 `ot0.a.D()`：根据实际 `protocolVersion` 选择流程，并读取 `supportProtocol & 3`。不能在未收到应答前假定协议版本，或只凭版本号跳入某个加密分支。0.3.0 已将下列版本 3–5 分支接入 App；早前照片显示这块表的版本为 5、身份已通过，**尚无对应完整 JSON 可核实该轮实际选择的加密能力及详细交互**。最新能力阶段失败的那一轮没有进入此流程。旧版本分支仍未实现。
 
 ### 版本 ≥ 3：本地身份检查
 
@@ -145,7 +179,7 @@ ATT 回调也独立记录：即使协议解析已结束，只要同一有效连�
 
 挑战封装为“一字节补零数 + AES-128 ECB 密文”，按 16 字节补零；已对齐时不额外补整块，不能替换为 PKCS#7。验证依据是返回挑战的变换结果，而不是收到任意通知。出处包括 `AESCipher`、`rt0.i.a()` 和 `libencrypt.so` 的 `key_generator`、`encrypt`、`_encrypt`。
 
-已建立独立重建程序及合成测试向量来检查算法和格式的一致性，但它们**不是官方客户端或手表捕获的已知答案**。没有运行目标原生库；最新身份通过照片是新增的实表界面证据，不能替代记录实际能力、分支及逐命令结果的完整诊断。
+已建立独立重建程序及合成测试向量来检查算法和格式的一致性，但它们**不是官方客户端或手表捕获的已知答案**。没有运行目标原生库；早前身份通过照片是实表界面证据，不能替代记录实际能力、分支及逐命令结果的完整诊断。
 
 ### 能力位要求加密时：RSA / AES-256
 
@@ -210,15 +244,17 @@ ATT 回调也独立记录：即使协议解析已结束，只要同一有效连�
 
 ## 6. 下一步需要的实机证据
 
-下一轮应使用 0.4.0 build 5，身份通过后在同一前台连接中点击“继续首次设置”，导出 schema 5 的完整 JSON，并说明手表点击前后的画面和能否进入主界面。优先核对：
+下一轮应使用 **0.4.1 build 6**，导出 **schema 6** 的完整 JSON；导出文件名包含 `v0.4.1-b6-` 和时间，需与 `platform` 和 `generatedAt` 一起核对。先记录能力查询及收包情况，只有身份通过后才在同一前台连接中点击“继续首次设置”。优先核对：
 
-1. `authentication.selectedCapabilities / capabilitySource / transportAuthenticated`，确认实际版本、能力来源及所需身份步骤；版本 5 不单独决定是否走加密分支。
-2. `businessSessionState / businessEncrypted`，确认认证上下文是否成功移交、实际业务模式及结束原因。
-3. `commandWrites` 中 `serviceID=11` 的 `commandID=7`、`11`，分别检查分片提交、确认及错误；ATT 全部成功不等同手表接受业务语义。
-4. `initialSetup.preQueryObservation` 与 `latestObservation / observations` 的区别，核对 `result / deviceType / oobeFrom / source / encodedFieldNumbers`，以及开始请求和查询的独立写入结果。
-5. 手表实际画面、确认操作和退出等待的时点。状态 0、10...59、未知值、超时或断开各自保留原始含义，不能统一改称“登录失败”；状态 60 也需要与手表可用性共同核验。
+1. `capabilityQuery` 的排队、实际提交、完整确认次数与 `hasCapabilities`；`commandWrites.queryAttempt` 对应各次写入。核对是否在已有有效能力时停止新重试、是否受写确认或截止时间限制；不能仅从 `1/1` 分片确认认定能力成功。
+2. 命令／文件的通知数和字节数、`decoderDiagnostics`、能力来源与终止错误。区分无命令通知、仅文件通知、空命令通知和已有字节但没有完整能力，不用旧版 30 次通知的数据代替本次结果。
+3. `authentication.selectedCapabilities / capabilitySource / transportAuthenticated`，确认实际版本、能力来源及所需身份步骤；版本 5 不单独决定是否走加密分支。
+4. `businessSessionState / businessEncrypted`，确认认证上下文是否成功移交、实际业务模式及结束原因。
+5. `commandWrites` 中 `serviceID=11` 的 `commandID=7`、`11`，分别检查分片提交、确认及错误；ATT 全部成功不等同手表接受业务语义。
+6. `initialSetup.preQueryObservation` 与 `latestObservation / observations` 的区别，核对 `result / deviceType / oobeFrom / source / encodedFieldNumbers`，以及开始请求和查询的独立写入结果。
+7. 手表实际画面、确认操作和退出等待的时点。状态 0、10...59、未知值、超时或断开各自保留原始含义，不能统一改称“登录失败”；状态 60 也需要与手表可用性共同核验。
 
-这些字段均位于 `vendorProtocol`。现有照片已支持继续推进身份后的业务验证，但尚不能给出完整离线使用或云端阻断的结论。若本版之后仍卡住，应依据新的真实状态定位账号、设备信息、同步或后续设置中的具体缺口，不能用伪造完成标记跳过证据。
+除版本、构建和生成时间外，上述协议字段均位于 `vendorProtocol`。早前照片支持继续推进身份后的业务验证，而最新截图要求先恢复本轮能力与身份；两者都尚不能给出完整离线使用或云端阻断的结论。若本版之后仍卡住，应先根据新报告确定实际阶段，再调查该阶段的写入、接收、账号、设备信息或同步缺口，不能用伪造完成标记跳过证据。
 
 ## 7. 可追溯来源
 
@@ -232,7 +268,7 @@ ATT 回调也独立记录：即使协议解析已结束，只要同一有效连�
 | 原生库 | `lib/arm64-v8a/libencrypt.so` |
 | 原生库 SHA-256 | `f7b7be63e26a6777f7a325d5f657ba9be8d98e892464163ee605589fd056b8ac` |
 
-类和方法标识针对这一 APK 版本，混淆名在其他版本中可能改变。传输与身份依据主要来自 classes18 的 `ht0` / `it0` / `ps0` / `ot0`、`ConsultProto` 及加密封装；原生 KDF 定位为该 ARM64 库中的 `key_generator`（虚拟地址 `0x3784–0x3ab4`），其 MD5 辅助函数位于 `0x3ab8–0x3d38`。本文记录独立归纳的事实和必要协议常量，不附带完整反编译源代码或原 APK。
+类和方法标识针对这一 APK 版本，混淆名在其他版本中可能改变。传输与身份依据主要来自 classes18 的 `ht0` / `it0` / `ps0` / `ot0`、`ConsultProto` 及加密封装；查询重试见 `ot0.a.M() / Q() / D()`、其超时 Runnable 与 `nd0.b.SCORLL_DELAYED=2000` 的 DEX 值，重连延迟见 `GattConnection.E() / F() / G()`。原生 KDF 定位为该 ARM64 库中的 `key_generator`（虚拟地址 `0x3784–0x3ab4`），其 MD5 辅助函数位于 `0x3ab8–0x3d38`。本文记录独立归纳的事实和必要协议常量，不附带完整反编译源代码或原 APK。
 
 ### Apple 官方文档
 

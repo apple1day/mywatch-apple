@@ -56,10 +56,28 @@ final class HomeUITests: XCTestCase {
         // Native preview must expose a complete JSON snapshot, not an excerpt.
         let reportData = try XCTUnwrap(reportText.data(using: .utf8))
         let report = try XCTUnwrap(JSONSerialization.jsonObject(with: reportData) as? [String: Any])
-        XCTAssertEqual(report["schemaVersion"] as? Int, 5)
+        XCTAssertEqual(report["schemaVersion"] as? Int, 6)
         let platform = try XCTUnwrap(report["platform"] as? [String: Any])
-        XCTAssertEqual(platform["appVersion"] as? String, "0.4.0")
-        XCTAssertEqual(platform["appBuild"] as? String, "5")
+        let appVersion = try XCTUnwrap(platform["appVersion"] as? String)
+        let appBuild = try XCTUnwrap(platform["appBuild"] as? String)
+        XCTAssertEqual(appVersion, "0.4.1")
+        XCTAssertEqual(appBuild, "6")
+        // The visible export identity must describe these exact snapshot bytes.
+        // It must not relabel an older report with the running app's version.
+        let versionMetadata = app.staticTexts["reportVersionMetadata"]
+        XCTAssertTrue(versionMetadata.exists)
+        XCTAssertEqual(versionMetadata.label, "报告版本：\(appVersion) · 构建 \(appBuild) · schema 6")
+        let generatedAt = try XCTUnwrap(report["generatedAt"] as? String)
+        let date = try XCTUnwrap(ISO8601DateFormatter().date(from: generatedAt))
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.calendar = Calendar(identifier: .gregorian)
+        dateFormatter.timeZone = .current
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let timeMetadata = app.staticTexts["reportGeneratedAtMetadata"]
+        XCTAssertTrue(timeMetadata.exists)
+        XCTAssertTrue(timeMetadata.label.contains(dateFormatter.string(from: date)))
+        XCTAssertTrue(timeMetadata.label.contains("UTC"))
         let capabilities = try XCTUnwrap(report["capabilities"] as? [String: Any])
         XCTAssertEqual(capabilities["initialSetup"] as? String, "EXPERIMENTAL_START_AND_STATE_OBSERVATION")
         let vendor = try XCTUnwrap(report["vendorProtocol"] as? [String: Any])

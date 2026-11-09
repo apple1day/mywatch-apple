@@ -183,6 +183,106 @@ final class VendorCommandAndCapabilityTests: XCTestCase {
         }
     }
 
+    func testEnabledSubscriptionsWithNoDataRemainAZeroNotificationTimeout() {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.commandNotificationsEnabled = true
+        snapshot.fileNotificationsEnabled = true
+        snapshot.commandNotificationActivation = "ENABLE_CONFIRMED"
+        snapshot.commandNotificationCallbackCount = 1
+        snapshot.capabilityQuery.queuedAttempts = 4
+        snapshot.capabilityQuery.submittedAttempts = 4
+        snapshot.capabilityQuery.acknowledgedAttempts = 4
+
+        let failure = snapshot.recordCapabilityTimeout(hasPendingData: false)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "NO_NOTIFICATIONS")
+        XCTAssertEqual(failure.phase, "PROTOCOL_RESPONSE")
+        XCTAssertTrue(failure.message.contains("命令 0、文件 0"))
+        XCTAssertEqual(snapshot.notificationCount, 0)
+        XCTAssertFalse(snapshot.authentication.transportAuthenticated)
+        XCTAssertEqual(snapshot.accountBinding, "NOT_IMPLEMENTED")
+    }
+
+    func testFileTrafficAndEmptyCommandNotificationsHaveDifferentTimeoutReasons() {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.recordNotification(channel: .file, byteCount: 20)
+        _ = snapshot.recordCapabilityTimeout(hasPendingData: false)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "FILE_NOTIFICATIONS_ONLY")
+        XCTAssertEqual(snapshot.receivedByteCount, 20)
+        XCTAssertEqual(snapshot.commandReceivedByteCount, 0)
+
+        snapshot.recordNotification(channel: .command, byteCount: 0)
+        _ = snapshot.recordCapabilityTimeout(hasPendingData: false)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "EMPTY_COMMAND_NOTIFICATIONS")
+        XCTAssertEqual(snapshot.commandNotificationCount, 1)
+        XCTAssertNil(snapshot.capabilities)
+    }
+
+    func testPartialCommandAndRejectedCompleteDataHaveDifferentTimeoutReasons() {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.recordNotification(channel: .command, byteCount: 20)
+        _ = snapshot.recordCapabilityTimeout(hasPendingData: true)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "INCOMPLETE_COMMAND_MESSAGE")
+
+        snapshot.decoderDiagnostics.lastIssue = "CRC_MISMATCH"
+        let failure = snapshot.recordCapabilityTimeout(hasPendingData: false)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "NO_VALID_CAPABILITIES")
+        XCTAssertTrue(failure.message.contains("CRC_MISMATCH"))
+        XCTAssertFalse(snapshot.authentication.identityVerified)
+    }
+
+    func testIncompleteRetryWriteIsNotReportedAsACompletedQueryWithNoResponse() {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.capabilityQuery.queuedAttempts = 2
+        snapshot.capabilityQuery.submittedAttempts = 2
+        snapshot.capabilityQuery.acknowledgedAttempts = 1
+        snapshot.attWriteAcknowledged = true // The first query did complete.
+        snapshot.capabilities = capability()
+
+        _ = snapshot.recordCapabilityTimeout(hasPendingData: false)
+        XCTAssertEqual(snapshot.capabilityTimeoutReason, "CAPABILITY_WRITE_INCOMPLETE")
+        XCTAssertFalse(snapshot.authentication.transportAuthenticated)
+        XCTAssertEqual(snapshot.capabilityQuery.acknowledgedAttempts, 1)
+    }
+
+    func testObservedCapabilityCannotBeMisreportedAsNoValidCapabilityAtTimeout() {
+        for isPreQuery in [false, true] {
+            var snapshot = VendorProbeSnapshot()
+            snapshot.capabilityQuery.queuedAttempts = 1
+            snapshot.capabilityQuery.submittedAttempts = 1
+            snapshot.capabilityQuery.acknowledgedAttempts = 1
+            if isPreQuery { snapshot.decoderDiagnostics.unsolicitedCapabilities = capability() }
+            else { snapshot.capabilities = capability() }
+
+            _ = snapshot.recordCapabilityTimeout(hasPendingData: false)
+            XCTAssertEqual(snapshot.capabilityTimeoutReason, "CAPABILITIES_OBSERVED_NOT_ADVANCED")
+            XCTAssertFalse(snapshot.authentication.transportAuthenticated)
+            XCTAssertEqual(snapshot.accountBinding, "NOT_IMPLEMENTED")
+        }
+    }
+
+    func testRetryAndSubscriptionObservationsSurviveReportEncoding() throws {
+        var snapshot = VendorProbeSnapshot()
+        snapshot.commandNotificationActivation = "ALREADY_ENABLED"
+        snapshot.fileNotificationActivation = "ENABLE_REQUESTED"
+        snapshot.commandNotificationsEnabled = true
+        snapshot.capabilityQuery.queuedAttempts = 2
+        snapshot.capabilityQuery.submittedAttempts = 2
+        snapshot.capabilityQuery.acknowledgedAttempts = 2
+        var receipt = VendorCommandWriteSnapshot(commandID: 1, stage: "TRANSPORT_QUERY", frameCount: 1,
+                                                queuedAt: Date(timeIntervalSince1970: 0))
+        receipt.queryAttempt = 2
+        snapshot.commandWrites = [receipt]
+        _ = snapshot.recordCapabilityTimeout(hasPendingData: false)
+
+        let restored = try JSONDecoder().decode(VendorProbeSnapshot.self, from: JSONEncoder().encode(snapshot))
+        XCTAssertEqual(restored, snapshot)
+        XCTAssertEqual(restored.commandNotificationCallbackCount, 0)
+        XCTAssertEqual(restored.commandNotificationActivation, "ALREADY_ENABLED")
+        XCTAssertEqual(restored.notificationCount, 0)
+        XCTAssertEqual(restored.commandWrites.first?.queryAttempt, 2)
+        XCTAssertEqual(restored.capabilityTimeoutReason, "NO_NOTIFICATIONS")
+    }
+
     private func capability(version: Int = 5, support: UInt32 = 3) -> OppoTransportCapabilities {
         OppoTransportCapabilities(protocolVersion: version, maxFrameSize: 20, maxTransmissionUnit: 20,
                                   interval: 10, supportProtocol: support, commandID: 0x81, controlFlags: 0,

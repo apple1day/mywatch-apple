@@ -101,6 +101,7 @@ struct VendorCommandWriteSnapshot: Codable, Equatable {
     var error: VendorGATTTransport.Failure?
     var serviceID = 1
     var encrypted = false
+    var queryAttempt: Int?
 
     var fullyAcknowledged: Bool {
         frameCount > 0 && acknowledgedFragments == frameCount && error == nil
@@ -136,6 +137,12 @@ struct VendorProbeSnapshot: Codable, Equatable {
     var accountBinding = "NOT_IMPLEMENTED"
     var commandNotificationsEnabled = false
     var fileNotificationsEnabled = false
+    var commandNotificationActivation = "NOT_REQUESTED"
+    var fileNotificationActivation = "NOT_REQUESTED"
+    var commandNotificationCallbackCount = 0
+    var fileNotificationCallbackCount = 0
+    var capabilityQuery = VendorCapabilityQuery.Snapshot()
+    var capabilityTimeoutReason: String?
     var requestSubmitted = false
     var attWriteAcknowledged = false
     var attWriteCallbackObserved = false
@@ -163,6 +170,38 @@ struct VendorProbeSnapshot: Codable, Equatable {
     var businessEncrypted: Bool?
     var ignoredBusinessMessageCount = 0
     var commandWrites: [VendorCommandWriteSnapshot] = []
+
+    /// A query timeout describes the observed receiving stage, not a login or
+    /// pairing failure. Zero traffic must remain visible rather than being
+    /// conflated with a decoder rejection or an incomplete message.
+    mutating func recordCapabilityTimeout(hasPendingData: Bool) -> VendorGATTTransport.Failure {
+        let message: String
+        if capabilityQuery.queuedAttempts > capabilityQuery.acknowledgedAttempts {
+            capabilityTimeoutReason = "CAPABILITY_WRITE_INCOMPLETE"
+            message = "能力协商等待超时，当前查询尚未取得完整 ATT 写入确认；身份验证未开始。"
+        } else if capabilities != nil || decoderDiagnostics.unsolicitedCapabilities != nil {
+            capabilityTimeoutReason = "CAPABILITIES_OBSERVED_NOT_ADVANCED"
+            message = "已观测到完整能力，但当前协商尚未满足继续条件；请导出本轮报告。"
+        } else if notificationCount == 0 {
+            capabilityTimeoutReason = "NO_NOTIFICATIONS"
+            message = "能力查询已写入，但本轮未收到任何手表通知（命令 0、文件 0）；身份验证未开始。请导出本轮报告，再断开重连。"
+        } else if commandNotificationCount == 0 {
+            capabilityTimeoutReason = "FILE_NOTIFICATIONS_ONLY"
+            message = "已收到文件通道通知，但命令通道没有通知；尚未取得可用于身份验证的能力信息。"
+        } else if commandReceivedByteCount == 0 {
+            capabilityTimeoutReason = "EMPTY_COMMAND_NOTIFICATIONS"
+            message = "命令通知已到达，但没有数据字节；尚未取得可用于身份验证的能力信息。"
+        } else if hasPendingData {
+            capabilityTimeoutReason = "INCOMPLETE_COMMAND_MESSAGE"
+            message = "已收到命令数据，但仍有未收齐的消息；等待完整能力信息超时。"
+        } else {
+            capabilityTimeoutReason = "NO_VALID_CAPABILITIES"
+            let detail = decoderDiagnostics.lastIssue.map { " 最近接收情况：\($0)。" } ?? ""
+            message = "已收到命令数据，但没有可用于身份验证的完整有效能力信息。\(detail)"
+        }
+        return .init(phase: "PROTOCOL_RESPONSE", domain: "WatchLink.ProtocolProbe",
+                     code: 1001, message: message)
+    }
 
     /// Records only the initial capability query, once per connection. The
     /// monitor validates the connection generation and exact characteristic,
@@ -198,7 +237,7 @@ struct VendorProbeSnapshot: Codable, Equatable {
         case "SUBSCRIBING": return "正在开启手表消息通道 · 请完成系统配对提示"
         case "WAITING_FOR_RESPONSE":
             return commandNotificationCount == 0
-                ? "已提交协议查询 · 等待手表回应"
+                ? "能力查询 \(capabilityQuery.submittedAttempts)/\(capabilityQuery.maximumAttempts) · 命令通知 0 条，等待手表回应"
                 : "正在等待能力信息 · 已收到 \(commandNotificationCount) 条命令通知"
         case "CAPABILITIES_RECEIVED_AUTH_PENDING": return "已收到手表协议回应 · 认证和绑定尚未完成"
         case "CAPABILITIES_WAITING_FOR_WRITE": return "已取得协议能力 · 等待查询写入确认"

@@ -44,8 +44,8 @@ final class ModelsTests: XCTestCase {
         let identifier = UUID(uuidString: "12345678-1234-5678-1234-567812345678")!
         let device = DiscoveredDevice(id: identifier, name: "OnePlus Watch A1B2", rssi: -45,
                                       isCandidate: true, advertisedServices: ["180F"], isConnectable: true)
-        let report = ProbeReport(schemaVersion: 5, generatedAt: Date(timeIntervalSince1970: 0),
-                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.4.0", appBuild: "5"),
+        let report = ProbeReport(schemaVersion: 6, generatedAt: Date(timeIntervalSince1970: 0),
+                                 platform: PlatformSnapshot(system: "iOS", systemVersion: "16.0", deviceType: "iPhone", appVersion: "0.4.1", appBuild: "6"),
                                  capabilities: CapabilitySnapshot(), selectedDevice: DeviceSnapshot(device: device, salt: "session"),
                                  observations: ObservationSnapshot(stateText: "GATT 检测完成", bluetoothState: "蓝牙已开启", scanningAtExport: false, connectingAtExport: false,
                                                                    gattConnectedAtExport: true, gattConnectionObservedThisAttempt: true, result: "GATT_DIAGNOSTICS_COMPLETE"),

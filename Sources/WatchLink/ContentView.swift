@@ -9,8 +9,16 @@ enum WatchColors {
 }
 
 private struct ReportSnapshot: Identifiable {
-    let id = UUID()
+    let id: UUID
     let data: Data
+    let metadata: ReportExportMetadata
+
+    init(data: Data) {
+        let id = UUID()
+        self.id = id
+        self.data = data
+        metadata = ReportExportMetadata(snapshot: data, exportID: id)
+    }
 }
 
 struct ContentView: View {
@@ -75,7 +83,9 @@ struct ContentView: View {
                 .background(.regularMaterial)
             }
             .sheet(isPresented: $showGuide) { GuideView() }
-            .sheet(item: $reportSnapshot) { snapshot in ReportView(snapshot: snapshot.data) }
+            .sheet(item: $reportSnapshot) { snapshot in
+                ReportView(snapshot: snapshot.data, metadata: snapshot.metadata)
+            }
         }
     }
 
@@ -88,7 +98,7 @@ struct ContentView: View {
                 Text("一代手表连接")
                     .font(.title.bold())
                     .accessibilityIdentifier("homeTitle")
-                Text("iPhone 连接验证版 · 0.4.0")
+                Text("iPhone 连接验证版 · 0.4.1")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Text("发现设备，记录真实的连接结果。")
@@ -258,9 +268,13 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if monitor.vendorProtocol.notificationCount > 0 {
+            if monitor.vendorProtocol.status != "NOT_ATTEMPTED" {
                 Text("收到手表消息：命令 \(monitor.vendorProtocol.commandNotificationCount) 条 · 文件 \(monitor.vendorProtocol.fileNotificationCount) 条")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("vendorNotificationCounts")
+                Text("能力查询：已提交 \(monitor.vendorProtocol.capabilityQuery.submittedAttempts)/\(monitor.vendorProtocol.capabilityQuery.maximumAttempts) 次 · 已确认 \(monitor.vendorProtocol.capabilityQuery.acknowledgedAttempts) 次")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("capabilityQueryCounts")
             }
             if let last = monitor.vendorProtocol.commandWrites.last {
                 Text("当前命令写入：\(last.acknowledgedFragments)/\(last.frameCount) 个分片已确认")
@@ -500,7 +514,8 @@ private struct GuideView: View {
                 }
                 Section("手机已确认，手表仍等待") {
                     Text("系统蓝牙配对、手表协议认证和业务绑定是不同阶段。标准信息能读取，不能证明后两步已完成，也不能直接证明系统已经持久保存配对。")
-                    Text("0.4.0 保留协议版本 3–5 的身份验证，并使用本次协商结果继续首次设置。版本 1–2 的旧密钥路径仍未适配。")
+                    Text("0.4.1 保留协议版本 3–5 的身份验证，并使用本次协商结果继续首次设置。版本 1–2 的旧密钥路径仍未适配。")
+                    Text("能力查询最多发送 4 次；未取得有效能力时，首片提交 2 秒后、且上一条已完整写入确认，才会重试。收到有效能力后停止新增重试；整个能力等待窗口最多 45 秒。消息计数为 0 时也会显示。")
                     Text("首次设置会发送开始设置请求并查询状态。本版尚未实现原厂账号登录、云绑定及完整同步；若手表仍等待，需要结合最新报告判断它停在哪个业务阶段。")
                     Text("系统配对提示不一定每次连接都出现。应根据命令通知、写入回执和协议结果判断当前进展；手表没有再次显示六位码，不能单独判断蓝牙是否连接。")
                 }
@@ -543,6 +558,7 @@ private struct JSONReportDocument: FileDocument {
 
 private struct ReportView: View {
     let snapshot: Data
+    let metadata: ReportExportMetadata
     @Environment(\.dismiss) private var dismiss
     @State private var isExporting = false
     @State private var showJSON = false
@@ -554,6 +570,12 @@ private struct ReportView: View {
                 Section {
                     Label("已截取当前诊断结果", systemImage: "doc.text")
                         .font(.headline)
+                    Text(metadata.versionSummary)
+                        .font(.subheadline.weight(.semibold))
+                        .accessibilityIdentifier("reportVersionMetadata")
+                    Text(metadata.generatedAtSummary)
+                        .font(.footnote.monospacedDigit())
+                        .accessibilityIdentifier("reportGeneratedAtMetadata")
                     Text("报告会保留点击导出时的状态。GATT 连接和原厂业务绑定在报告中分别标注。")
                         .font(.subheadline).foregroundStyle(.secondary)
                     Text("包含所选设备名称、系统版本及服务信息；发送前可展开下方内容查看。")
@@ -591,7 +613,7 @@ private struct ReportView: View {
             .fileExporter(isPresented: $isExporting,
                           document: JSONReportDocument(data: snapshot),
                           contentType: .json,
-                          defaultFilename: "WatchLink-iOS-\(Self.filenameDate())") { result in
+                          defaultFilename: metadata.suggestedFilename) { result in
                 switch result {
                 case .success: exportStatus = "报告已保存。"
                 case .failure: exportStatus = "报告未保存，可重新选择保存位置。"
@@ -600,12 +622,6 @@ private struct ReportView: View {
         }
     }
 
-    private static func filenameDate() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
-    }
 }
 
 /// Keep the list row bounded while UIKit handles scrolling and selection of the

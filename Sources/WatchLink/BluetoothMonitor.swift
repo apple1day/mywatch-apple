@@ -73,6 +73,12 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     private var vendorCharacteristics: [CBCharacteristic] = []
     private var vendorTransport: VendorGATTTransport?
     private var vendorDecoder = OppoTransportDecoder(emitAuthenticationMessages: true, emitBusinessMessages: true)
+    private var capabilityQuery: VendorCapabilityQuery?
+    private var activeCapabilityAttempt: Int?
+    private var capabilityRetryWork: DispatchWorkItem?
+    private var capabilityRetryRevision = 0
+    // Four capability queries, four identity commands, two setup commands.
+    private static let maximumLogicalCommands = 10
     private var authentication: OppoAuthentication?
     private var businessSession: OppoBusinessSession?
     private var setupEngine: OppoSetup?
@@ -174,7 +180,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                             min(capabilities.maxTransmissionUnit, transport.maximumWriteLength))
             let fragments = try OppoProtocol.encodePayload(payload, encrypted: session.isEncrypted,
                                                             maximumFrameLength: limit)
-            guard vendorProtocol.commandWrites.count < 8 else { throw OppoWireError.tooManyFragments }
+            guard vendorProtocol.commandWrites.count < Self.maximumLogicalCommands else { throw OppoWireError.tooManyFragments }
             var receipt = VendorCommandWriteSnapshot(commandID: Int(command.commandID),
                                                       stage: command.phase.rawValue, frameCount: fragments.count,
                                                       queuedAt: Date())
@@ -254,6 +260,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
         businessSession?.invalidate()
         businessSession = nil
+        cancelCapabilityRetry()
         authentication?.cancel()
         authentication = nil
         vendorProtocol.businessSessionState = failure == nil ? "ENDED" : "FAILED"
@@ -287,6 +294,10 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                                                uuid: OppoGATTProfile.fileNotify)
         let token = generation
         vendorDecoder.reset()
+        cancelCapabilityRetry()
+        capabilityQuery?.cancel()
+        capabilityQuery = nil
+        activeCapabilityAttempt = nil
         authentication?.cancel()
         authentication = nil
         businessSession?.invalidate()
@@ -331,19 +342,86 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         )
         vendorTransport = transport
         transport.start()
+        // A report exported before the first Core Bluetooth callback must
+        // still distinguish a requested subscription from one never started.
+        recordVendorNotifications()
     }
 
     private func beginVendorQuery() {
-        guard let transport = vendorTransport, transport.isReady else { return }
-        vendorProtocol.commandWrites.append(.init(commandID: 1, stage: "TRANSPORT_QUERY",
-                                                  frameCount: 1, queuedAt: Date()))
+        guard capabilityQuery == nil, let transport = vendorTransport, transport.isReady else { return }
+        let query = VendorCapabilityQuery()
+        capabilityQuery = query
+        if vendorProtocol.capabilities != nil || vendorDecoder.diagnostics.unsolicitedCapabilities != nil {
+            _ = query.capabilitiesAvailable()
+        }
+        handleCapabilityQueryActions(query.start())
+    }
+
+    private func handleCapabilityQueryActions(_ actions: [VendorCapabilityQuery.Action]) {
+        if let capabilityQuery { vendorProtocol.capabilityQuery = capabilityQuery.snapshot }
+        for action in actions {
+            guard isCheckingVendorProtocol, authentication == nil,
+                  !vendorProtocol.authentication.transportAuthenticated else { return }
+            switch action {
+            case .send(let attempt):
+                sendCapabilityQuery(attempt: attempt)
+            case .scheduleRetry(let attempt, let seconds):
+                scheduleCapabilityRetry(attempt: attempt, seconds: seconds)
+            case .readyForAuthentication:
+                cancelCapabilityRetry()
+                beginAuthenticationIfReady()
+            }
+        }
+    }
+
+    private func sendCapabilityQuery(attempt: Int) {
+        guard let transport = vendorTransport, transport.isReady, !transport.isWriting,
+              activeVendorWriteIndex == nil,
+              vendorProtocol.commandWrites.count < Self.maximumLogicalCommands else {
+            vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                    code: 1002, message: "能力查询与当前写入状态或命令预算不一致。"))
+            return
+        }
+        var receipt = VendorCommandWriteSnapshot(commandID: 1, stage: "TRANSPORT_QUERY",
+                                                 frameCount: 1, queuedAt: Date())
+        receipt.queryAttempt = attempt
+        vendorProtocol.commandWrites.append(receipt)
         activeVendorWriteIndex = vendorProtocol.commandWrites.count - 1
+        activeCapabilityAttempt = attempt
         activeAuthenticationToken = nil
         activeSetupToken = nil
         if !transport.send(fragments: [OppoProtocol.transportConsultRequest], intervalMilliseconds: 10), isCheckingVendorProtocol {
             vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
                                     code: 1002, message: "能力查询没有进入发送队列。"))
         }
+    }
+
+    private func observeAvailableCapabilities() {
+        guard isCheckingVendorProtocol, authentication == nil, let capabilityQuery,
+              vendorProtocol.capabilities != nil || vendorDecoder.diagnostics.unsolicitedCapabilities != nil else { return }
+        cancelCapabilityRetry()
+        handleCapabilityQueryActions(capabilityQuery.capabilitiesAvailable())
+    }
+
+    private func scheduleCapabilityRetry(attempt: Int, seconds: TimeInterval) {
+        cancelCapabilityRetry()
+        let token = generation
+        let revision = capabilityRetryRevision
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.generation == token, self.capabilityRetryRevision == revision,
+                  self.isCheckingVendorProtocol, self.authentication == nil,
+                  let query = self.capabilityQuery else { return }
+            self.capabilityRetryWork = nil
+            self.handleCapabilityQueryActions(query.retryTimerFired(attempt: attempt))
+        }
+        capabilityRetryWork = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    private func cancelCapabilityRetry() {
+        capabilityRetryRevision &+= 1
+        capabilityRetryWork?.cancel()
+        capabilityRetryWork = nil
     }
 
     private func vendorFragmentSubmitted(_ fragmentIndex: Int) {
@@ -369,22 +447,31 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             handleAuthenticationActions(authentication.didSubmit(
                 token: token, streamOffset: vendorDecoder.diagnostics.receivedByteCount))
         } else {
-            vendorDecoder.markQuerySubmitted()
-            vendorProtocol.requestSubmitted = true
-            vendorProtocol.querySubmittedAt = Date()
-            vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
+            guard let attempt = activeCapabilityAttempt, let capabilityQuery else {
+                vendorProbeFailed(.init(phase: "COMMAND_WRITE", domain: "WatchLink.ProtocolProbe",
+                                        code: 1006, message: "能力查询缺少本轮发送记录。"))
+                return
+            }
+            if !vendorProtocol.requestSubmitted {
+                // Retries keep the original receive-stream boundary and the
+                // original total deadline; neither old fragments nor late
+                // replies acquire a new request identity.
+                vendorDecoder.markQuerySubmitted()
+                vendorProtocol.requestSubmitted = true
+                vendorProtocol.querySubmittedAt = Date()
+                vendorProtocol.decoderDiagnostics = vendorDecoder.diagnostics
+                setTimer(seconds: 45) { [weak self] in
+                    guard let self, self.isCheckingVendorProtocol, self.authentication == nil else { return }
+                    let failure = self.vendorProtocol.recordCapabilityTimeout(
+                        hasPendingData: self.vendorDecoder.hasPendingData)
+                    self.vendorProbeFailed(failure)
+                }
+            }
             vendorProtocol.status = "WAITING_FOR_RESPONSE"
             result = "VENDOR_PROTOCOL_WAITING_FOR_RESPONSE"
+            addEvent("提交第 \(attempt)/4 次传输能力查询；重试保留首轮接收边界，取得能力并完成当前写入后才进入身份验证。")
+            handleCapabilityQueryActions(capabilityQuery.didSubmit(attempt: attempt))
             stateText = vendorProtocol.summary
-            addEvent("已提交传输能力查询。取得完整能力并确认写入后，才会选择相应的身份流程。")
-            setTimer(seconds: 45) { [weak self] in
-                guard let self, self.isCheckingVendorProtocol, self.authentication == nil else { return }
-                let detail = self.vendorDecoder.diagnostics.lastIssue.map { " 最近接收情况：\($0)。" } ?? ""
-                self.vendorProbeFailed(.init(phase: "PROTOCOL_RESPONSE", domain: "WatchLink.ProtocolProbe",
-                                             code: 1001, message: self.vendorDecoder.hasPendingData
-                                                ? "等待能力信息超时，仍有未完成的消息。\(detail)"
-                                                : "未取得可用于身份认证的完整能力信息。\(detail)"))
-            }
         }
     }
 
@@ -397,8 +484,10 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         }
         let token = activeAuthenticationToken
         let setupToken = activeSetupToken
+        let queryAttempt = activeCapabilityAttempt
         let commandID = vendorProtocol.commandWrites[index].commandID
         activeVendorWriteIndex = nil
+        activeCapabilityAttempt = nil
         activeAuthenticationToken = nil
         activeSetupToken = nil
         if let setupToken, let setupEngine {
@@ -407,13 +496,15 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         } else if let token, let authentication {
             addEvent("身份流程命令 \(commandID) 的全部分片已收到 ATT 确认；设备协议校验单独判断。")
             handleAuthenticationActions(authentication.writeCompleted(token: token, succeeded: true))
-        } else {
-            beginAuthenticationIfReady()
+        } else if let queryAttempt, let capabilityQuery {
+            addEvent("第 \(queryAttempt) 次能力查询的 ATT 写入已完整确认，设备能力仍以实际回包为准。")
+            handleCapabilityQueryActions(capabilityQuery.writeCompleted(attempt: queryAttempt, succeeded: true))
         }
     }
 
     private func beginAuthenticationIfReady() {
         guard isCheckingVendorProtocol, authentication == nil, !vendorProtocol.authentication.transportAuthenticated,
+              capabilityQuery?.isReadyForAuthentication == true,
               vendorProtocol.attWriteAcknowledged, activeVendorWriteIndex == nil,
               let transport = vendorTransport, transport.isReady, !transport.isWriting else { return }
         let choice: VendorCapabilitySelection.Choice
@@ -430,6 +521,9 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         let selected = choice.capabilities
         let source = choice.source
         cancelTimer()
+        cancelCapabilityRetry()
+        if let capabilityQuery { vendorProtocol.capabilityQuery = capabilityQuery.snapshot }
+        capabilityQuery = nil
         vendorProtocol.authentication.selectedCapabilities = selected
         vendorProtocol.authentication.capabilitySource = source
         vendorProtocol.authentication.startedAt = Date()
@@ -510,7 +604,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         do {
             let fragments = try OppoProtocol.encode(service: command.serviceID, command: command.commandID,
                                                      protobuf: command.protobuf, maximumFrameLength: frameLimit)
-            guard vendorProtocol.commandWrites.count < 8 else {
+            guard vendorProtocol.commandWrites.count < Self.maximumLogicalCommands else {
                 throw OppoDecodeError.oversizedInput
             }
             vendorProtocol.commandWrites.append(.init(commandID: Int(command.commandID), stage: command.phase.rawValue,
@@ -530,7 +624,10 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func vendorTransportFailed(_ failure: VendorGATTTransport.Failure) {
-        if isSettingUp, let setupEngine, let token = activeSetupToken {
+        if let capabilityQuery, let attempt = activeCapabilityAttempt {
+            handleCapabilityQueryActions(capabilityQuery.writeCompleted(attempt: attempt, succeeded: false))
+            if isCheckingVendorProtocol { vendorProbeFailed(failure) }
+        } else if isSettingUp, let setupEngine, let token = activeSetupToken {
             handleSetupActions(setupEngine.writeCompleted(token: token, succeeded: false), transportFailure: failure)
             if isSettingUp { businessSessionFailed(failure) }
         } else if businessSession != nil {
@@ -606,14 +703,14 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     /// Call before showing the share sheet to preserve the current connection state.
     func makeReport() -> Data {
         let report = ProbeReport(
-            schemaVersion: 5,
+            schemaVersion: 6,
             generatedAt: Date(),
             platform: PlatformSnapshot(
                 system: UIDevice.current.systemName,
                 systemVersion: UIDevice.current.systemVersion,
                 deviceType: UIDevice.current.model,
-                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0",
-                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "5"
+                appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.1",
+                appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "6"
             ),
             capabilities: CapabilitySnapshot(),
             selectedDevice: selectedDevice.map { DeviceSnapshot(device: $0, salt: sessionSalt) },
@@ -654,6 +751,13 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
     }
 
     private func retireRadio() {
+        cancelCapabilityRetry()
+        if let capabilityQuery {
+            capabilityQuery.cancel()
+            vendorProtocol.capabilityQuery = capabilityQuery.snapshot
+        }
+        capabilityQuery = nil
+        activeCapabilityAttempt = nil
         recordVendorNotifications()
         if isVendorSessionLive {
             _ = vendorDecoder.finish()
@@ -1015,7 +1119,8 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             }
             if vendorProtocol.commandWrites[index].recordCallback(error: failure, at: Date()),
                vendorProtocol.commandWrites[index].serviceID == 1,
-               vendorProtocol.commandWrites[index].commandID == 1 {
+               vendorProtocol.commandWrites[index].commandID == 1,
+               vendorProtocol.commandWrites[index].queryAttempt == 1 {
                 if vendorProtocol.recordWriteCompletion(error: failure, at: Date()) {
                     addEvent(failure == nil ? "能力查询的 ATT 写入已确认。" : "能力查询的 ATT 写入返回错误。")
                 }
@@ -1038,6 +1143,10 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
         guard let transport = vendorTransport else { return }
         vendorProtocol.commandNotificationsEnabled = transport.commandNotificationsEnabled
         vendorProtocol.fileNotificationsEnabled = transport.fileNotificationsEnabled
+        vendorProtocol.commandNotificationActivation = transport.commandNotificationActivation
+        vendorProtocol.fileNotificationActivation = transport.fileNotificationActivation
+        vendorProtocol.commandNotificationCallbackCount = transport.commandNotificationCallbackCount
+        vendorProtocol.fileNotificationCallbackCount = transport.fileNotificationCallbackCount
     }
 
     private func receiveVendorData(_ channel: VendorGATTTransport.Channel, data: Data) {
@@ -1082,7 +1191,7 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
                 if isCheckingVendorProtocol && authentication == nil {
                     vendorProtocol.status = "CAPABILITIES_WAITING_FOR_WRITE"
                     addEvent("已取得完整有效的协议能力消息，等待查询写入完成后进入身份验证。")
-                    beginAuthenticationIfReady()
+                    observeAvailableCapabilities()
                 }
             case .message(let message):
                 if let authentication { handleAuthenticationActions(authentication.receive(message)) }
@@ -1096,11 +1205,21 @@ final class BluetoothMonitor: NSObject, ObservableObject, CBCentralManagerDelega
             }
         }
         guard isVendorSessionLive else { return }
+        // A complete pre-query capability produces diagnostics, not a decoded
+        // query-response event. It must still stop pending capability retries.
+        observeAvailableCapabilities()
         beginAuthenticationIfReady()
         stateText = vendorProtocol.summary
     }
 
     private func vendorProbeFailed(_ error: VendorGATTTransport.Failure) {
+        cancelCapabilityRetry()
+        if let capabilityQuery {
+            capabilityQuery.cancel()
+            vendorProtocol.capabilityQuery = capabilityQuery.snapshot
+        }
+        capabilityQuery = nil
+        activeCapabilityAttempt = nil
         if vendorProtocol.authentication.transportAuthenticated {
             businessSessionFailed(error)
             return
