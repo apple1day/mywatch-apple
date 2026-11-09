@@ -88,7 +88,7 @@ struct ContentView: View {
                 Text("一代手表连接")
                     .font(.title.bold())
                     .accessibilityIdentifier("homeTitle")
-                Text("iPhone 连接验证版 · 0.2.0")
+                Text("iPhone 连接验证版 · 0.2.1")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 Text("发现设备，记录真实的连接结果。")
@@ -191,6 +191,11 @@ struct ContentView: View {
             Text(monitor.selectedDevice?.name ?? "未选择设备")
                 .font(.title3.weight(.semibold))
                 .textSelection(.enabled)
+            if monitor.isConnected {
+                Text("蓝牙通道已连接 · 原厂绑定尚未验证")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
             if monitor.isConnected || monitor.isConnecting {
                 Button(monitor.isConnecting ? "取消连接" : "断开 GATT", role: .destructive) {
                     monitor.disconnect()
@@ -207,7 +212,7 @@ struct ContentView: View {
                 .disabled(!monitor.canConnect)
                 .accessibilityIdentifier("connectButton")
             }
-            Text("连接后先读取标准设备信息，再可检查手表的协议回应。进入后台会释放连接。健康同步、通知、表盘和原厂绑定尚未实现。")
+            Text("连接后先读取标准设备信息，再可检查手表的协议回应。进入后台会释放连接。健康同步、手机通知同步、表盘和原厂绑定尚未实现。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -232,6 +237,18 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!monitor.canCheckVendorProtocol)
             .accessibilityIdentifier("checkVendorProtocolButton")
+            if monitor.vendorProtocol.notificationCount > 0 {
+                Text("收到手表通知：命令 \(monitor.vendorProtocol.commandNotificationCount) 条 · 文件 \(monitor.vendorProtocol.fileNotificationCount) 条")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if monitor.vendorProtocol.requestSubmitted {
+                Text(monitor.vendorProtocol.attWriteCallbackObserved
+                     ? (monitor.vendorProtocol.attWriteAcknowledged ? "蓝牙写入回执：已确认" : "蓝牙写入回执：返回错误，详见报告")
+                     : "蓝牙写入回执：尚未收到")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let capabilities = monitor.vendorProtocol.capabilities {
                 Text("手表返回的协议版本：\(capabilities.protocolVersion)")
                     .font(.subheadline)
@@ -240,6 +257,12 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             } else if let failure = monitor.vendorProtocol.error {
                 Text(failure.message)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            if monitor.vendorProtocol.capabilities == nil,
+               let observed = monitor.vendorProtocol.decoderDiagnostics.unsolicitedCapabilities {
+                Text("查询前开始的消息包含协议版本 \(observed.protocolVersion)，已单独记录。本次查询的应答状态另行判断。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -400,7 +423,8 @@ private struct GuideView: View {
                 }
                 Section("手机已确认，手表仍等待") {
                     Text("系统蓝牙配对、手表协议认证和业务绑定是不同阶段。标准信息能读取，不能证明后两步已完成，也不能直接证明系统已经持久保存配对。")
-                    Text("0.2.0 新增已核实通道的通知订阅和一次传输能力查询。只保存解析后的能力和失败阶段，后续身份认证与绑定尚未实现。")
+                    Text("0.2.1 修复了接收早期通知与孤立分片时过早停止的问题。命令数据从订阅开始持续解析，查询前的消息单独记录；后续身份认证与绑定尚未实现。")
+                    Text("系统配对提示不一定每次连接都出现。应根据命令通知、写入回执和协议结果判断当前进展；手表没有再次显示六位码，不能单独判断蓝牙是否连接。")
                 }
                 Section("为什么和安卓不同") {
                     Text("安卓验证版能够尝试一代的自定义 RFCOMM 双通道，普通 iOS App 没有直接对应的公共接口。实表报告已确认另一组 BLE 命令特征存在，本版据此增加了协议能力检查。")

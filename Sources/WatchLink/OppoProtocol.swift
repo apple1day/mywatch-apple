@@ -116,66 +116,258 @@ enum OppoDecodeEvent: Equatable {
     case rejected(OppoDecodeError)
 }
 
-/// A connection-scoped, fail-closed stream decoder. Reset when changing devices,
-/// reconnecting or starting a new explicit probe. BLE notification boundaries
-/// are unrelated to protocol frame boundaries.
+/// Header/protocol metadata only. No raw characteristic or message payload is
+/// retained in reports. The origin of a frame can differ from that of its
+/// message when a fragmented message crosses the query submission boundary.
+struct OppoFrameMetadata: Codable, Equatable {
+    let streamOffset: Int
+    let origin: String
+    let messageOrigin: String?
+    let byteCount: Int
+    let bodyLength: Int
+    let controlFlags: UInt16
+    let fragmentType: Int
+    let fragmentSequence: Int?
+    let crcValidation: String
+    let serviceID: Int?
+    let commandID: Int?
+    let disposition: String
+}
+
+struct OppoDecoderDiagnostics: Codable, Equatable {
+    var receivedByteCount = 0
+    var validatedFrameCount = 0
+    var discardedByteCount = 0
+    var crcFailureCount = 0
+    var orphanFragmentCount = 0
+    var sequenceGapCount = 0
+    var replacedFragmentCount = 0
+    var ignoredCommandCount = 0
+    var encryptedFrameCount = 0
+    var invalidCapabilityCount = 0
+    var echoCount = 0
+    var preQueryMessageCount = 0
+    var postQueryMessageCount = 0
+    var incompleteMessageCount = 0
+    var droppedMessageCount = 0
+    var lastIssue: String?
+    var recentFrames: [OppoFrameMetadata] = []
+    var unsolicitedCapabilities: OppoTransportCapabilities?
+}
+
+/// Feed all command notifications, including those received while subscribing.
+/// Mark the query once immediately before submission, without flushing bytes or
+/// fragments. Only a message whose first header starts after that boundary can
+/// produce `.capabilities`. Unsolicited traffic and recoverable framing errors
+/// are observations; only bounded-resource exhaustion stops this decoder.
 struct OppoTransportDecoder {
     static let maximumFrameBodyLength = 512
     static let maximumMessageLength = 1024
     static let maximumBufferedLength = 4096
     static let maximumFragmentCount = 64
+    static let maximumReceivedByteCount = 64 * 1024
+    static let maximumRecentFrames = 32
 
     private var buffer: [UInt8] = []
+    private var bufferStartOffset = 0
+    private var queryBoundaryOffset: Int?
     private var fragmentPayload: [UInt8]?
+    private var fragmentStartOffset: Int?
     private var lastFragmentSequence: UInt8?
     private var fragmentCount = 0
     private var fragmentCRCOrders: Set<CRCByteOrder> = []
     private var failed = false
+    private(set) var diagnostics = OppoDecoderDiagnostics()
 
     var hasPendingData: Bool { !buffer.isEmpty || fragmentPayload != nil }
 
     mutating func reset() {
         buffer.removeAll(keepingCapacity: false)
-        fragmentPayload = nil
-        lastFragmentSequence = nil
-        fragmentCount = 0
-        fragmentCRCOrders.removeAll()
+        bufferStartOffset = 0
+        queryBoundaryOffset = nil
+        clearFragments()
         failed = false
+        diagnostics = OppoDecoderDiagnostics()
+    }
+
+    mutating func markQuerySubmitted() {
+        guard queryBoundaryOffset == nil, !failed else { return }
+        queryBoundaryOffset = diagnostics.receivedByteCount
     }
 
     mutating func append(_ data: Data) -> [OppoDecodeEvent] {
         guard !failed, !data.isEmpty else { return [] }
         guard data.count <= Self.maximumBufferedLength,
-              buffer.count <= Self.maximumBufferedLength - data.count else {
+              buffer.count <= Self.maximumBufferedLength - data.count,
+              diagnostics.receivedByteCount <= Self.maximumReceivedByteCount - data.count else {
             return [reject(.oversizedInput)]
         }
         buffer.append(contentsOf: data)
+        diagnostics.receivedByteCount += data.count
         var events: [OppoDecodeEvent] = []
-        do {
-            while let packet = try nextPacket() {
-                if let completed = try assemble(packet) {
-                    events.append(.capabilities(try decodeCapabilities(
-                        completed.payload, control: completed.control, frames: completed.frames,
-                        crcValidation: completed.crcValidation)))
-                }
+        var cursor = 0
+        scan: while cursor < buffer.count {
+            if buffer[cursor] != 0xaa {
+                let nextHeader = buffer[(cursor + 1)...].firstIndex(of: 0xaa) ?? buffer.count
+                diagnostics.discardedByteCount += nextHeader - cursor
+                if diagnostics.lastIssue == nil { recordIssue(.invalidPreamble) }
+                clearFragments()
+                cursor = nextHeader
+                continue
             }
-        } catch let error as OppoDecodeError {
-            events.append(reject(error))
-        } catch {
-            events.append(reject(.malformedProtobuf))
+            switch scanPacket(at: cursor) {
+            case .incomplete:
+                break scan
+            case .invalid(let issue):
+                recordIssue(issue)
+                if issue == .checksumMismatch { diagnostics.crcFailureCount += 1 }
+                diagnostics.discardedByteCount += 1
+                clearFragments()
+                cursor += 1
+            case .packet(let packet):
+                diagnostics.validatedFrameCount += 1
+                if let event = process(packet) { events.append(event) }
+                cursor += packet.byteCount
+            }
+        }
+        if cursor > 0 {
+            buffer.removeFirst(cursor)
+            bufferStartOffset += cursor
         }
         return events
+    }
+
+    private mutating func clearFragments() {
+        fragmentPayload = nil
+        fragmentStartOffset = nil
+        lastFragmentSequence = nil
+        fragmentCount = 0
+        fragmentCRCOrders.removeAll()
+    }
+
+    private func origin(of offset: Int) -> String {
+        if let boundary = queryBoundaryOffset, offset >= boundary { return "POST_QUERY" }
+        return "PRE_QUERY"
+    }
+
+    private mutating func recordIssue(_ issue: OppoDecodeError) {
+        diagnostics.lastIssue = issue.diagnosticMessage
+    }
+
+    private mutating func recordFrame(_ packet: Packet, messageStart: Int?, payload: [UInt8]?, disposition: String) {
+        let fragmentType = Int(packet.control & 3)
+        let metadata = OppoFrameMetadata(
+            streamOffset: packet.startOffset, origin: origin(of: packet.startOffset),
+            messageOrigin: messageStart.map { origin(of: $0) }, byteCount: packet.byteCount,
+            bodyLength: packet.bodyLength, controlFlags: packet.control, fragmentType: fragmentType,
+            fragmentSequence: fragmentType == 0 ? nil : packet.payload.first.map(Int.init),
+            crcValidation: Self.crcValidation(for: Set(packet.crcOrder.map { [$0] } ?? [])),
+            serviceID: payload.flatMap { $0.count >= 2 ? Int($0[0]) : nil },
+            commandID: payload.flatMap { $0.count >= 2 ? Int($0[1]) : nil }, disposition: disposition)
+        diagnostics.recentFrames.append(metadata)
+        if diagnostics.recentFrames.count > Self.maximumRecentFrames {
+            diagnostics.recentFrames.removeFirst(diagnostics.recentFrames.count - Self.maximumRecentFrames)
+        }
+    }
+
+    private mutating func process(_ packet: Packet) -> OppoDecodeEvent? {
+        let fragmentType = packet.control & 3
+        let messageStart = fragmentType <= 1 ? packet.startOffset : fragmentStartOffset
+        if packet.control & 0x0040 != 0 {
+            diagnostics.encryptedFrameCount += 1
+            recordIssue(.encryptedFrame)
+            recordFrame(packet, messageStart: messageStart, payload: nil, disposition: "IGNORED_ENCRYPTED_FRAME")
+            // Like other single frames, this notification is independent of
+            // an in-progress fragmented message. An unsupported fragment can
+            // no longer be safely associated with that assembly.
+            if fragmentType != 0 { clearFragments() }
+            return nil
+        }
+        // Bit 3 is emitted by the APK and does not alter its parsing. Its
+        // semantics are not labelled ACK. Other unknown controls are not used.
+        guard packet.control & ~UInt16(0x000b) == 0 else {
+            recordIssue(.unsupportedControl)
+            recordFrame(packet, messageStart: messageStart, payload: nil, disposition: "IGNORED_UNSUPPORTED_CONTROL")
+            if fragmentType != 0 { clearFragments() }
+            return nil
+        }
+
+        do {
+            guard let completed = try assemble(packet) else {
+                let initialPayload = fragmentType == 1 ? Array(packet.payload.dropFirst()) : nil
+                recordFrame(packet, messageStart: messageStart, payload: initialPayload,
+                            disposition: fragmentType == 1 ? "FRAGMENT_START" : "FRAGMENT_CONTINUATION")
+                return nil
+            }
+            if origin(of: completed.startOffset) == "PRE_QUERY" {
+                diagnostics.preQueryMessageCount += 1
+            } else {
+                diagnostics.postQueryMessageCount += 1
+            }
+            do {
+                let capabilities = try decodeCapabilities(completed.payload, control: completed.control,
+                                                          frames: completed.frames, crcValidation: completed.crcValidation)
+                if origin(of: completed.startOffset) == "PRE_QUERY" {
+                    diagnostics.unsolicitedCapabilities = capabilities
+                    recordFrame(packet, messageStart: completed.startOffset, payload: completed.payload,
+                                disposition: "UNSOLICITED_CAPABILITIES")
+                    return nil
+                }
+                recordFrame(packet, messageStart: completed.startOffset, payload: completed.payload,
+                            disposition: "CAPABILITIES_AFTER_QUERY")
+                return .capabilities(capabilities)
+            } catch let issue as OppoDecodeError {
+                recordIssue(issue)
+                let disposition: String
+                switch issue {
+                case .unexpectedCommand:
+                    diagnostics.ignoredCommandCount += 1
+                    disposition = "IGNORED_OTHER_COMMAND"
+                case .loopbackOrEcho:
+                    diagnostics.echoCount += 1
+                    disposition = "IGNORED_AMBIGUOUS_ECHO"
+                default:
+                    diagnostics.invalidCapabilityCount += 1
+                    disposition = "INVALID_CAPABILITY_MESSAGE"
+                }
+                recordFrame(packet, messageStart: completed.startOffset, payload: completed.payload, disposition: disposition)
+                return nil
+            }
+        } catch let issue as OppoDecodeError {
+            recordIssue(issue)
+            switch issue {
+            case .unexpectedFragment: diagnostics.orphanFragmentCount += 1
+            case .fragmentSequenceMismatch: diagnostics.sequenceGapCount += 1
+            default: diagnostics.droppedMessageCount += 1
+            }
+            recordFrame(packet, messageStart: nil, payload: nil, disposition: "IGNORED_\(issue.rawValue)")
+            clearFragments()
+        } catch {
+            recordIssue(.malformedProtobuf)
+            diagnostics.droppedMessageCount += 1
+            clearFragments()
+        }
+        return nil
     }
 
     /// Call when the probe expires or its notification stream ends. A partial
     /// header/frame or unfinished fragment sequence can never become success.
     mutating func finish() -> OppoDecodeEvent? {
         guard !failed, hasPendingData else { return nil }
-        return reject(.incompleteFrame)
+        recordIssue(.incompleteFrame)
+        diagnostics.incompleteMessageCount += 1
+        diagnostics.discardedByteCount += buffer.count
+        buffer.removeAll(keepingCapacity: false)
+        bufferStartOffset = diagnostics.receivedByteCount
+        clearFragments()
+        return nil
     }
 
     private mutating func reject(_ error: OppoDecodeError) -> OppoDecodeEvent {
-        reset()
+        recordIssue(error)
+        buffer.removeAll(keepingCapacity: false)
+        bufferStartOffset = diagnostics.receivedByteCount
+        clearFragments()
         failed = true
         return .rejected(error)
     }
@@ -186,10 +378,19 @@ struct OppoTransportDecoder {
     }
 
     private struct Packet {
+        let startOffset: Int
+        let byteCount: Int
+        let bodyLength: Int
         let control: UInt16
         let payload: [UInt8]
         // nil means both CRC bytes are identical, so either ordering verifies.
         let crcOrder: CRCByteOrder?
+    }
+
+    private enum ScanResult {
+        case incomplete
+        case invalid(OppoDecodeError)
+        case packet(Packet)
     }
 
     private static func crcValidation(for orders: Set<CRCByteOrder>) -> String {
@@ -200,71 +401,69 @@ struct OppoTransportDecoder {
         return "CRC16_LE_VERIFIED"
     }
 
-    private mutating func nextPacket() throws -> Packet? {
-        guard !buffer.isEmpty else { return nil }
-        guard buffer[0] == 0xaa else { throw OppoDecodeError.invalidPreamble }
-        guard buffer.count >= 2 else { return nil }
+    private func scanPacket(at start: Int) -> ScanResult {
+        guard buffer.count - start >= 2 else { return .incomplete }
 
-        var bodyLength = Int(buffer[1] & 0x7f)
+        var bodyLength = Int(buffer[start + 1] & 0x7f)
         var lengthBytes = 1
-        if buffer[1] & 0x80 != 0 {
-            guard buffer.count >= 3 else { return nil }
-            // The APK length field has at most two bytes. Reject noncanonical
-            // encodings rather than scanning arbitrary bytes for a new header.
-            guard buffer[2] & 0x80 == 0, buffer[2] != 0 else {
-                throw OppoDecodeError.invalidFrameLength
+        if buffer[start + 1] & 0x80 != 0 {
+            guard buffer.count - start >= 3 else { return .incomplete }
+            guard buffer[start + 2] & 0x80 == 0, buffer[start + 2] != 0 else {
+                return .invalid(.invalidFrameLength)
             }
-            bodyLength |= Int(buffer[2]) << 7
+            bodyLength |= Int(buffer[start + 2]) << 7
             lengthBytes = 2
         }
-        guard bodyLength >= 4 else { throw OppoDecodeError.invalidFrameLength }
-        guard bodyLength <= Self.maximumFrameBodyLength else { throw OppoDecodeError.oversizedFrame }
-        let bodyStart = 1 + lengthBytes
+        guard bodyLength >= 4 else { return .invalid(.invalidFrameLength) }
+        guard bodyLength <= Self.maximumFrameBodyLength else { return .invalid(.oversizedFrame) }
+        let bodyStart = start + 1 + lengthBytes
         let checksumIndex = bodyStart + bodyLength
-        let totalLength = checksumIndex + 2
-        guard buffer.count >= totalLength else { return nil }
+        let end = checksumIndex + 2
+        guard buffer.count >= end else { return .incomplete }
 
         let littleEndianCRC = UInt16(buffer[checksumIndex]) | (UInt16(buffer[checksumIndex + 1]) << 8)
         let bigEndianCRC = (UInt16(buffer[checksumIndex]) << 8) | UInt16(buffer[checksumIndex + 1])
-        let calculatedCRC = OppoProtocol.crc16(bytes: buffer.prefix(checksumIndex))
+        let calculatedCRC = OppoProtocol.crc16(bytes: buffer[start..<checksumIndex])
         guard calculatedCRC == littleEndianCRC || calculatedCRC == bigEndianCRC else {
-            throw OppoDecodeError.checksumMismatch
+            return .invalid(.checksumMismatch)
         }
         // The APK sender uses LE, while its receive path explicitly accepts
         // either trailer byte order. Preserve this compatibility and provenance.
         let crcOrder: CRCByteOrder? = littleEndianCRC == bigEndianCRC ? nil :
             (calculatedCRC == littleEndianCRC ? .littleEndian : .bigEndian)
         let control = UInt16(buffer[bodyStart]) | (UInt16(buffer[bodyStart + 1]) << 8)
-        guard control & 0x0040 == 0 else { throw OppoDecodeError.encryptedFrame }
-        // Low bits 0...3 select single/first/middle/last. The APK sender can
-        // set bit 3 and its parser ignores it; do not invent an ACK meaning.
-        guard control & ~UInt16(0x000b) == 0 else { throw OppoDecodeError.unsupportedControl }
         let payload = Array(buffer[(bodyStart + 2)..<checksumIndex])
-        buffer.removeFirst(totalLength)
-        return Packet(control: control, payload: payload, crcOrder: crcOrder)
+        return .packet(Packet(startOffset: bufferStartOffset + start, byteCount: end - start,
+                              bodyLength: bodyLength, control: control, payload: payload, crcOrder: crcOrder))
     }
 
-    private mutating func assemble(_ packet: Packet) throws -> (payload: [UInt8], control: UInt16, frames: Int, crcValidation: String)? {
+    private mutating func assemble(_ packet: Packet) throws -> (payload: [UInt8], control: UInt16, frames: Int, crcValidation: String, startOffset: Int)? {
         let fragmentType = packet.control & 0x0003
         if fragmentType == 0 {
-            guard fragmentPayload == nil else { throw OppoDecodeError.interleavedMessage }
+            // APK ps0.g.n processes a single frame independently while a
+            // fragmented message is pending. Do not discard either one.
             let orders = Set(packet.crcOrder.map { [$0] } ?? [])
-            return (packet.payload, packet.control, 1, Self.crcValidation(for: orders))
+            return (packet.payload, packet.control, 1, Self.crcValidation(for: orders), packet.startOffset)
         }
 
         guard packet.payload.count >= 2 else { throw OppoDecodeError.invalidFrameLength }
         let sequence = packet.payload[0]
         let bytes = packet.payload.dropFirst()
         if fragmentType == 1 {
-            guard fragmentPayload == nil else { throw OppoDecodeError.interleavedMessage }
+            if fragmentPayload != nil {
+                diagnostics.replacedFragmentCount += 1
+                recordIssue(.interleavedMessage)
+            }
             fragmentPayload = Array(bytes)
+            fragmentStartOffset = packet.startOffset
             lastFragmentSequence = sequence
             fragmentCount = 1
             fragmentCRCOrders = Set(packet.crcOrder.map { [$0] } ?? [])
             return nil
         }
 
-        guard var assembled = fragmentPayload, let previous = lastFragmentSequence else {
+        guard var assembled = fragmentPayload, let previous = lastFragmentSequence,
+              let startOffset = fragmentStartOffset else {
             throw OppoDecodeError.unexpectedFragment
         }
         guard sequence == previous &+ 1 else { throw OppoDecodeError.fragmentSequenceMismatch }
@@ -278,11 +477,8 @@ struct OppoTransportDecoder {
         if fragmentType == 3 {
             let frames = fragmentCount
             let crcValidation = Self.crcValidation(for: fragmentCRCOrders)
-            fragmentPayload = nil
-            lastFragmentSequence = nil
-            fragmentCount = 0
-            fragmentCRCOrders.removeAll()
-            return (assembled, packet.control, frames, crcValidation)
+            clearFragments()
+            return (assembled, packet.control, frames, crcValidation, startOffset)
         }
         fragmentPayload = assembled
         lastFragmentSequence = sequence

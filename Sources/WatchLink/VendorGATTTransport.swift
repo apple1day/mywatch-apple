@@ -46,7 +46,6 @@ final class VendorGATTTransport {
     private static let maximumFragments = 64
     private static let maximumOutgoingBytes = 64 * 1024
     private static let maximumIncomingValueBytes = 4 * 1024
-    private static let maximumBufferedIncomingBytes = 64 * 1024
 
     private let peripheral: CBPeripheral
     private let commandWrite: CBCharacteristic
@@ -65,8 +64,6 @@ final class VendorGATTTransport {
     private var outgoingFragmentsAccepted = 0
     private var outgoingBytesAccepted = 0
     private var awaitingWriteAcknowledgement = false
-    private var bufferedIncoming: [(Channel, Data)] = []
-    private var bufferedIncomingBytes = 0
     private var deadline: DispatchWorkItem?
     private var deadlineGeneration: UInt64 = 0
 
@@ -222,17 +219,10 @@ final class VendorGATTTransport {
             reject(phase: phase, code: 6, message: "单次通知超过接收大小上限。")
             return
         }
-        if state == .subscribing {
-            guard bufferedIncoming.count < Self.maximumFragments,
-                  data.count <= Self.maximumBufferedIncomingBytes - bufferedIncomingBytes else {
-                reject(phase: phase, code: 6, message: "通知初始化期间的接收缓冲已达上限。")
-                return
-            }
-            bufferedIncoming.append((channel, data))
-            bufferedIncomingBytes += data.count
-        } else {
-            onReceived(channel, data)
-        }
+        // The owner's stream decoder must see every command byte from the first
+        // notification, including traffic arriving before subscription setup ends.
+        // Query provenance belongs to that decoder, not a transport delivery delay.
+        onReceived(channel, data)
     }
 
     func writeCompleted(_ device: CBPeripheral, characteristic: CBCharacteristic, error: Error?) {
@@ -273,17 +263,6 @@ final class VendorGATTTransport {
         cancelDeadline()
         expectedSubscription = nil
         state = .ready
-        // Deliver pre-query notifications before onReady can submit a query.
-        // Otherwise an unsolicited packet received during subscription could be
-        // retroactively attributed to the new query as its response.
-        while state == .ready, !bufferedIncoming.isEmpty {
-            let (channel, data) = bufferedIncoming.removeFirst()
-            bufferedIncomingBytes -= data.count
-            onReceived(channel, data)
-        }
-        // A bounded-buffer or receiver failure may have cancelled this session
-        // while delivering an early notification. Never start a query afterwards.
-        guard state == .ready else { return }
         onReady()
     }
 
@@ -350,8 +329,6 @@ final class VendorGATTTransport {
         outgoing = []
         outgoingIndex = 0
         awaitingWriteAcknowledgement = false
-        bufferedIncoming = []
-        bufferedIncomingBytes = 0
     }
 
     private func reject(phase: String, code: Int, message: String) {

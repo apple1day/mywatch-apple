@@ -37,18 +37,62 @@ struct VendorProbeSnapshot: Codable, Equatable {
     var fileNotificationsEnabled = false
     var requestSubmitted = false
     var attWriteAcknowledged = false
+    var attWriteCallbackObserved = false
+    var attWriteCompletedAt: Date?
+    var attWriteError: VendorGATTTransport.Failure?
     var notificationCount = 0
     var preQueryNotificationCount = 0
     var receivedByteCount = 0
+    var commandNotificationCount = 0
+    var fileNotificationCount = 0
+    var preQueryCommandNotificationCount = 0
+    var preQueryFileNotificationCount = 0
+    var commandReceivedByteCount = 0
+    var fileReceivedByteCount = 0
     var startedAt: Date?
+    var querySubmittedAt: Date?
     var responseAt: Date?
+    var responseCorrelation: String?
     var capabilities: OppoTransportCapabilities?
+    var decoderDiagnostics = OppoDecoderDiagnostics()
     var error: VendorGATTTransport.Failure?
+
+    /// One command is submitted per connection. The monitor first validates the
+    /// connection generation and exact write characteristic, even after parsing
+    /// has finished, so a late ATT result remains an independent observed fact.
+    @discardableResult
+    mutating func recordWriteCompletion(error: VendorGATTTransport.Failure?, at date: Date) -> Bool {
+        guard requestSubmitted, !attWriteCallbackObserved else { return false }
+        attWriteCallbackObserved = true
+        attWriteCompletedAt = date
+        attWriteAcknowledged = error == nil
+        attWriteError = error
+        return true
+    }
+
+    mutating func recordNotification(channel: VendorGATTTransport.Channel, byteCount: Int) {
+        notificationCount += 1
+        receivedByteCount += byteCount
+        if !requestSubmitted { preQueryNotificationCount += 1 }
+        switch channel {
+        case .command:
+            commandNotificationCount += 1
+            commandReceivedByteCount += byteCount
+            if !requestSubmitted { preQueryCommandNotificationCount += 1 }
+        case .file:
+            fileNotificationCount += 1
+            fileReceivedByteCount += byteCount
+            if !requestSubmitted { preQueryFileNotificationCount += 1 }
+        }
+    }
 
     var summary: String {
         switch status {
         case "SUBSCRIBING": return "正在开启手表消息通道 · 请完成系统配对提示"
-        case "WAITING_FOR_RESPONSE": return "已发送协议查询 · 等待手表回应"
+        case "WAITING_FOR_RESPONSE":
+            return commandNotificationCount == 0
+                ? "已提交协议查询 · 等待手表回应"
+                : "正在等待能力信息 · 已收到 \(commandNotificationCount) 条命令通知"
         case "CAPABILITIES_RECEIVED_AUTH_PENDING": return "已收到手表协议回应 · 认证和绑定尚未完成"
         case "FAILED": return "协议检查未完成 · 请导出报告查看失败阶段"
         case "INTERRUPTED": return "协议检查已中断 · 本次结果已保留"
